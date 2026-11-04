@@ -15,6 +15,18 @@ Newer PCSX2 versions refuse to load save states made by older ones. This tool co
 Each of these was tested by loading converted save states in the official PCSX2 release.
 Converting back to an older version isn't supported, and neither is PCSX2 1.6 or older.
 
+### Why not back to an older version?
+
+Think of it like a save file from a newer game version. A newer PCSX2 saves a little more
+information than an older PCSX2 knows what to do with.
+
+Going forward is easy: the newer PCSX2 understands the older save and fills in anything
+missing. Going backward is not: the older PCSX2 has no idea what the extra information means.
+If we threw it away, important details (especially sound) would be lost, and the game might
+not continue exactly where you left off.
+
+So the tool only offers conversions that are known to work properly.
+
 ## How to use it
 
 1. Grab `PCSX2-SaveState-Converter-<version>-win-x64.exe` from the releases page and run it.
