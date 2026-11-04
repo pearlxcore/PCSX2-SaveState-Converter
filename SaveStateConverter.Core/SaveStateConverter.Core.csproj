@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>SaveStateConverter</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="../catalog/stable-formats.json" Link="stable-formats.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../catalog/routes.json" Link="routes.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../catalog/game-titles.tsv" Link="game-titles.tsv" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <!-- Also embedded, for the single-file build (see ShippedData). -->
+  <ItemGroup>
+    <EmbeddedResource Include="../catalog/stable-formats.json" LogicalName="catalog/stable-formats.json" />
+    <EmbeddedResource Include="../catalog/routes.json" LogicalName="catalog/routes.json" />
+    <EmbeddedResource Include="../catalog/game-titles.tsv" LogicalName="catalog/game-titles.tsv" />
+  </ItemGroup>
+  <!-- Local builds get the converter from the git-ignored native folder, so they can convert when run
+       directly. Releases get it from tools/Package-Release.ps1. -->
+  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)../native/pcsx2-stateconvert.exe')">
+    <None Include="$(MSBuildThisFileDirectory)../native/*.exe;$(MSBuildThisFileDirectory)../native/*.dll"
+          Link="native/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="SharpCompress" Version="0.50.7" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="SaveStateConverter.Tests" />
+  </ItemGroup>
+</Project>

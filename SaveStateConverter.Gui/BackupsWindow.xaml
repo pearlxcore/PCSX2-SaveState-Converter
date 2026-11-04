@@ -1,0 +1,41 @@
+<Window x:Class="SaveStateConverter.Gui.BackupsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Backups" Width="920" Height="540" MinWidth="640" MinHeight="360"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False" UseLayoutRounding="True" Icon="app.ico"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}" FontFamily="Segoe UI" FontSize="12">
+    <DockPanel Margin="12">
+        <TextBlock DockPanel.Dock="Top" Style="{StaticResource SecondaryText}" Margin="0,0,0,10"
+                   Text="When you replace save states, the originals are copied here first, one backup per run. Putting them back never overwrites a save state you made after converting. Backups are never deleted automatically." />
+
+        <DockPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+            <TextBlock Text="Backup folder" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <Button DockPanel.Dock="Right" Content="Browse..." Click="BrowseBackup" Margin="6,0,0,0" />
+            <TextBox Text="{Binding BackupFolder, UpdateSourceTrigger=LostFocus}" KeyDown="CommitOnEnter"
+                     AutomationProperties.AutomationId="BackupsFolder" AutomationProperties.Name="Backup folder" />
+        </DockPanel>
+
+        <DockPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+            <Button DockPanel.Dock="Right" Content="_Close" IsCancel="True" Click="CloseClick" MinWidth="84" AutomationProperties.AutomationId="CloseBackups" />
+            <StackPanel Orientation="Horizontal">
+                <Button Style="{StaticResource PrimaryButton}" Content="_Put the Originals Back" Command="{Binding RestoreCommand}"
+                        AutomationProperties.AutomationId="Restore" />
+                <Button Content="Copy the Originals to a _Folder..." Click="RestoreToFolder" IsEnabled="{Binding CanRestore}" Margin="8,0,0,0"
+                        AutomationProperties.AutomationId="RestoreToFolder" />
+                <Button Content="_Open Backup Folder" Command="{Binding OpenBackupCommand}" Margin="8,0,0,0" AutomationProperties.AutomationId="OpenBackup" />
+            </StackPanel>
+        </DockPanel>
+        <TextBlock DockPanel.Dock="Bottom" Text="{Binding BackupStatus}" Style="{StaticResource SecondaryText}" Margin="0,8,0,0"
+                   AutomationProperties.AutomationId="BackupStatus" />
+
+        <DataGrid ItemsSource="{Binding BackupSets}" SelectedItem="{Binding SelectedBackup}" AutoGenerateColumns="False" IsReadOnly="True"
+                  RowHeight="28" AutomationProperties.AutomationId="BackupSets">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Made On" Binding="{Binding Created, StringFormat=g}" Width="170" />
+                <DataGridTextColumn Header="Save States" Binding="{Binding Manifest.Entries.Count}" Width="100" />
+                <DataGridTextColumn Header="Converted For" Binding="{Binding Manifest.TargetRelease, StringFormat=PCSX2 {0}}" Width="130" />
+                <DataGridTextColumn Header="From Folder" Binding="{Binding Manifest.SourceFolder}" Width="*" />
+            </DataGrid.Columns>
+        </DataGrid>
+    </DockPanel>
+</Window>

@@ -1,0 +1,2 @@
+# Patches must stay byte-exact to apply to the PCSX2 tree.
+*.patch -text

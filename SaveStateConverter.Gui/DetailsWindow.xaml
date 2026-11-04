@@ -1,0 +1,84 @@
+<Window x:Class="SaveStateConverter.Gui.DetailsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="{Binding Title, StringFormat={}{0} - Details}" Width="760" Height="560" MinWidth="520" MinHeight="380"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False" UseLayoutRounding="True" Icon="app.ico"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}" FontFamily="Segoe UI" FontSize="12">
+    <DockPanel Margin="12">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button Content="Show in _Folder" Click="ShowInFolder" Margin="0,0,8,0" />
+            <Button Content="_Close" IsCancel="True" IsDefault="True" Click="CloseClick" MinWidth="84" AutomationProperties.AutomationId="CloseDetails" />
+        </StackPanel>
+
+        <GroupBox DockPanel.Dock="Top" Header="Save state">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="86" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid.Resources>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Margin" Value="0,0,0,5" />
+                        <Setter Property="TextWrapping" Value="Wrap" />
+                    </Style>
+                </Grid.Resources>
+                <TextBlock Text="Game" Foreground="{StaticResource SecondaryTextBrush}" />
+                <TextBlock Grid.Column="1" Text="{Binding Title}" FontWeight="SemiBold" />
+                <TextBlock Grid.Row="1" Text="Code" Foreground="{StaticResource SecondaryTextBrush}" />
+                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Serial}" />
+                <TextBlock Grid.Row="2" Text="Slot" Foreground="{StaticResource SecondaryTextBrush}" />
+                <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Slot}" />
+                <TextBlock Grid.Row="3" Text="Made with" Foreground="{StaticResource SecondaryTextBrush}" />
+                <TextBlock Grid.Row="3" Grid.Column="1">
+                    <Run Text="{Binding MadeWith, Mode=OneWay}" /><Run Text="  (save format " /><Run Text="{Binding FormatText, Mode=OneWay}" /><Run Text=")" />
+                </TextBlock>
+                <TextBlock Grid.Row="4" Text="File" Foreground="{StaticResource SecondaryTextBrush}" />
+                <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Path}" />
+                <TextBlock Grid.Row="5" Text="Status" Foreground="{StaticResource SecondaryTextBrush}" />
+                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,5">
+                    <Ellipse Style="{StaticResource StatusDot}" />
+                    <TextBlock Text="{Binding StatusText}" Margin="0" />
+                </StackPanel>
+                <TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding StatusDetail}" Foreground="{StaticResource SecondaryTextBrush}" />
+            </Grid>
+        </GroupBox>
+
+        <GroupBox Header="Conversion report" Margin="0,8,0,0">
+            <Border Background="{StaticResource BaseBrush}" BorderBrush="{StaticResource FieldBorderBrush}" BorderThickness="1" CornerRadius="2">
+                <Grid>
+                    <TextBlock Margin="8" Foreground="{StaticResource DisabledTextBrush}" TextWrapping="Wrap"
+                               Text="The technical report appears here after this save state is converted.">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding Report.Count}" Value="0">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto" Padding="8,6">
+                        <ItemsControl ItemsSource="{Binding Report}" FontFamily="Consolas" FontSize="11">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding}" TextWrapping="Wrap" />
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+        </GroupBox>
+    </DockPanel>
+</Window>

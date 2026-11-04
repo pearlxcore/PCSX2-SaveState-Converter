@@ -1,0 +1,2990 @@
+diff --git a/pcsx2-qt/QtHost.cpp b/pcsx2-qt/QtHost.cpp
+index fc8b85bc9..88288296e 100644
+--- a/pcsx2-qt/QtHost.cpp
++++ b/pcsx2-qt/QtHost.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
++#include "pcsx2/SaveState.h"
+ #include "AutoUpdaterDialog.h"
+ #include "Debugger/DebuggerWindow.h"
+ #include "DisplayWidget.h"
+@@ -92,6 +93,8 @@ static bool s_batch_mode = false;
+ static bool s_nogui_mode = false;
+ static bool s_start_big_picture_mode = false;
+ static bool s_start_fullscreen = false;
++static std::string s_legacy_input;
++static std::string s_legacy_output;
+ static bool s_test_config_and_exit = false;
+ static bool s_run_setup_wizard = false;
+ static bool s_cleanup_after_update = false;
+@@ -2286,6 +2289,22 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
+ 				s_start_big_picture_mode = true;
+ 				continue;
+ 			}
++			else if (CHECK_ARG_PARAM(QStringLiteral("-diagnose-legacy-state")))
++			{
++				s_legacy_input = (++it)->toStdString();
++				continue;
++			}
++			else if (CHECK_ARG_PARAM(QStringLiteral("-convert-legacy-state")))
++			{
++				s_legacy_input = (++it)->toStdString();
++				if (it + 1 == args.end())
++				{
++					QtHost::PrintCommandLineHelp(args.front().toStdString());
++					return false;
++				}
++				s_legacy_output = (++it)->toStdString();
++				continue;
++			}
+ 			else if (CHECK_ARG(QStringLiteral("-testconfig")))
+ 			{
+ 				s_test_config_and_exit = true;
+@@ -2491,6 +2510,24 @@ int main(int argc, char* argv[])
+ 	if (!QtHost::InitializeConfig())
+ 		return EXIT_FAILURE;
+ 
++	// Experimental legacy save-state translation. Runs without starting a VM; the
++	// translation code is the same module used by the save-state loader.
++	if (!s_legacy_input.empty())
++	{
++		LogWindow::updateSettings();
++		Error error;
++		std::vector<std::string> report;
++		const bool ok = SaveState_ConvertLegacy(s_legacy_input, s_legacy_output, &report, &error);
++		for (const std::string& line : report)
++			std::fprintf(stdout, "%s\n", line.c_str());
++		if (ok && !s_legacy_output.empty())
++			std::fprintf(stdout, "Wrote native save state: %s\n", s_legacy_output.c_str());
++		if (!ok)
++			std::fprintf(stdout, "FAILED: %s\n", error.GetDescription().c_str());
++		std::fflush(stdout);
++		return ok ? EXIT_SUCCESS : EXIT_FAILURE;
++	}
++
+ 	// Are we just setting up the configuration?
+ 	if (s_test_config_and_exit)
+ 		return EXIT_SUCCESS;
+diff --git a/pcsx2-stateconvert/link_stubs.cpp b/pcsx2-stateconvert/link_stubs.cpp
+new file mode 100644
+index 000000000..251b3c24b
+--- /dev/null
++++ b/pcsx2-stateconvert/link_stubs.cpp
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
++// SPDX-License-Identifier: GPL-3.0+
++
++// Storage for emulator globals that core headers bind static references to (for example
++// R5900.h: `static fpuRegisters& fpuRegs = _cpuRegistersPack.fpuRegs;`). The translation
++// module only uses these headers for type layouts and never reads or writes VM state, so
++// these definitions exist solely to satisfy the linker in the standalone tool.
++
++#include "MemoryTypes.h"
++#include "R5900.h"
++#include "VU.h"
++
++alignas(16) cpuRegistersPack _cpuRegistersPack;
++VURegs vuRegs[2];
++alignas(__pagealignsize) u8 eeHw[Ps2MemSize::Hardware];
+diff --git a/pcsx2-stateconvert/main.cpp b/pcsx2-stateconvert/main.cpp
+new file mode 100644
+index 000000000..47e4558c7
+--- /dev/null
++++ b/pcsx2-stateconvert/main.cpp
+@@ -0,0 +1,206 @@
++// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
++// SPDX-License-Identifier: GPL-3.0+
++
++// pcsx2-stateconvert: standalone translator for legacy PCSX2 save states.
++// Compiled from the same translation module (pcsx2/SaveStateLegacy.cpp) that the experimental
++// emulator loader uses, so standalone conversion and in-emulator loading cannot diverge.
++//
++//   pcsx2-stateconvert [--json] inspect <state.p2s> [--target 9A50|9A54|9A55|9A59]
++//   pcsx2-stateconvert [--json] convert <legacy.p2s> <output.p2s> [--target 9A50|9A54|9A55|9A59]
++//   pcsx2-stateconvert [--json] formats
++//
++// Sources: 0x9A4F (2.0.x), 0x9A50 (2.2.0), 0x9A54 (2.4.0), 0x9A55 (2.6.x). The default target is
++// this build's format (0x9A59, PCSX2 2.8.2); older targets are reachable only from older sources
++// (see `formats`).
++//
++// Exit codes: 0 success, 1 not convertible or invalid input, 2 usage, 3 output could not be written.
++
++#include "SaveState.h"
++#include "SaveStateLegacy.h"
++
++#include "common/Error.h"
++#include "common/StringUtil.h"
++#include "common/ZipHelpers.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++namespace
++{
++	std::string JsonEscape(std::string_view text)
++	{
++		std::string out;
++		out.reserve(text.size() + 2);
++		for (const char ch : text)
++		{
++			switch (ch)
++			{
++				case '"': out += "\\\""; break;
++				case '\\': out += "\\\\"; break;
++				case '\n': out += "\\n"; break;
++				case '\r': out += "\\r"; break;
++				case '\t': out += "\\t"; break;
++				default:
++					if (static_cast<unsigned char>(ch) < 0x20)
++						out += fmt::format("\\u{:04x}", static_cast<unsigned>(ch));
++					else
++						out += ch;
++					break;
++			}
++		}
++		return out;
++	}
++
++	struct Result
++	{
++		bool ok = false;
++		int exit_code = 1;
++		std::string error;
++		std::string output;
++		const SaveStateLegacy::ConvertedState* state = nullptr;
++	};
++
++	void Print(const Result& result, bool json)
++	{
++		const SaveStateLegacy::ConvertedState* state = result.state;
++		if (!json)
++		{
++			if (state)
++			{
++				for (const std::string& line : state->report.lines)
++					std::printf("%s\n", line.c_str());
++			}
++			if (!result.output.empty())
++				std::printf("Wrote native save state: %s\n", result.output.c_str());
++			if (!result.ok)
++				std::printf("FAILED: %s\n", result.error.c_str());
++			return;
++		}
++
++		const u32 target = (state && state->target_format) ? state->target_format : (g_SaveVersion >> 16);
++		std::string text = fmt::format("{{\"ok\":{},\"targetFormat\":\"{:04X}\"", result.ok ? "true" : "false", target);
++		if (state && state->source_version != 0)
++		{
++			text += fmt::format(",\"sourceFormat\":\"{:04X}\",\"sourceBuild\":\"{}\"", state->source_version >> 16,
++				JsonEscape(state->source_build));
++		}
++		if (!result.output.empty())
++			text += fmt::format(",\"output\":\"{}\"", JsonEscape(result.output));
++		if (!result.ok)
++			text += fmt::format(",\"error\":\"{}\"", JsonEscape(result.error));
++		text += ",\"report\":[";
++		if (state)
++		{
++			for (size_t i = 0; i < state->report.lines.size(); i++)
++				text += fmt::format("{}\"{}\"", i ? "," : "", JsonEscape(state->report.lines[i]));
++		}
++		text += "]}";
++		std::printf("%s\n", text.c_str());
++	}
++} // namespace
++
++int wmain(int argc, wchar_t** argv)
++{
++	std::vector<std::string> args;
++	for (int i = 1; i < argc; i++)
++		args.push_back(StringUtil::WideStringToUTF8String(argv[i]));
++
++	bool json = false;
++	if (!args.empty() && args.front() == "--json")
++	{
++		json = true;
++		args.erase(args.begin());
++	}
++
++	if (args.size() == 1 && args[0] == "formats")
++	{
++		// Forward routes only: every source to this build's format, older sources to every
++		// newer stable format.
++		static constexpr const char* routes[][2] = {{"9A4F", "9A50"}, {"9A4F", "9A54"}, {"9A50", "9A54"},
++			{"9A4F", "9A55"}, {"9A50", "9A55"}, {"9A54", "9A55"}};
++		const u32 native = g_SaveVersion >> 16;
++		if (json)
++		{
++			std::printf("{\"routes\":[");
++			for (const char* source : {"9A4F", "9A50", "9A54", "9A55"})
++				std::printf("{\"source\":\"%s\",\"target\":\"%04X\"},", source, native);
++			for (size_t i = 0; i < std::size(routes); i++)
++				std::printf("{\"source\":\"%s\",\"target\":\"%s\"}%s", routes[i][0], routes[i][1], i + 1 < std::size(routes) ? "," : "");
++			std::printf("]}\n");
++		}
++		else
++		{
++			std::printf("sources: 0x9A4F (2.0.x), 0x9A50 (2.2.0), 0x9A54 (2.4.0), 0x9A55 (2.6.x) -> 0x%04X\n", native);
++			for (const auto& route : routes)
++				std::printf("0x%s -> 0x%s\n", route[0], route[1]);
++		}
++		return 0;
++	}
++
++	u16 target_format = 0;
++	for (size_t i = 0; i + 1 < args.size(); i++)
++	{
++		if (args[i] != "--target")
++			continue;
++		target_format = static_cast<u16>(std::strtoul(args[i + 1].c_str(), nullptr, 16));
++		if (target_format != (g_SaveVersion >> 16) && target_format != SaveStateLegacy::TargetFormat9A55 &&
++			target_format != SaveStateLegacy::TargetFormat9A54 && target_format != SaveStateLegacy::TargetFormat9A50)
++		{
++			std::fprintf(stderr, "unsupported target format '%s'\n", args[i + 1].c_str());
++			return 2;
++		}
++		args.erase(args.begin() + i, args.begin() + i + 2);
++		break;
++	}
++
++	const bool inspect = args.size() == 2 && args[0] == "inspect";
++	const bool convert = args.size() == 3 && args[0] == "convert";
++	if (!inspect && !convert)
++	{
++		std::fprintf(stderr, "usage: pcsx2-stateconvert [--json] inspect <state.p2s> | convert <legacy.p2s> <output.p2s> "
++							 "[--target 9A50|9A54|9A55|9A59] | formats\n");
++		return 2;
++	}
++
++	SaveStateLegacy::ConvertedState state;
++	state.report.echo_to_console = false;
++	state.target_format = target_format;
++	Result result;
++	result.state = &state;
++
++	zip_error_t ze = {};
++	auto zf = zip_open_managed(args[1].c_str(), ZIP_RDONLY, &ze);
++	if (!zf)
++	{
++		result.error = fmt::format("cannot open '{}': {}", args[1], zip_error_strerror(&ze));
++		Print(result, json);
++		return 1;
++	}
++
++	Error error;
++	result.ok = SaveStateLegacy::ConvertArchive(zf.get(), &state, &error);
++	if (!result.ok)
++	{
++		result.error = error.GetDescription();
++		Print(result, json);
++		return 1;
++	}
++
++	if (convert)
++	{
++		if (!SaveStateLegacy::WriteArchive(state, args[2].c_str(), &error))
++		{
++			result.ok = false;
++			result.error = error.GetDescription();
++			Print(result, json);
++			return 3;
++		}
++		result.output = args[2];
++	}
++
++	result.exit_code = 0;
++	Print(result, json);
++	return 0;
++}
+diff --git a/pcsx2-stateconvert/pcsx2-stateconvert.vcxproj b/pcsx2-stateconvert/pcsx2-stateconvert.vcxproj
+new file mode 100644
+index 000000000..f67a7d03f
+--- /dev/null
++++ b/pcsx2-stateconvert/pcsx2-stateconvert.vcxproj
+@@ -0,0 +1,82 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Standalone legacy save-state translator. Compiles pcsx2/SaveStateLegacy.cpp with the same
++     include paths, defines and forced include as the pcsx2 core, so structure layouts match the
++     emulator exactly; links only common, fmt and libzip. -->
++<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
++  <Import Project="$(SolutionDir)common\vsprops\BaseProjectConfig.props" />
++  <Import Project="$(SolutionDir)common\vsprops\WinSDK.props" />
++  <PropertyGroup Label="Globals">
++    <ProjectGuid>{6521948A-6A1E-4F56-808B-FA5EF167B888}</ProjectGuid>
++  </PropertyGroup>
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
++  <PropertyGroup Label="Configuration">
++    <ConfigurationType>Application</ConfigurationType>
++    <CharacterSet>Unicode</CharacterSet>
++    <PlatformToolset Condition="!$(Configuration.Contains(Clang))">$(DefaultPlatformToolset)</PlatformToolset>
++    <PlatformToolset Condition="$(Configuration.Contains(Clang))">ClangCL</PlatformToolset>
++    <WholeProgramOptimization Condition="$(Configuration.Contains(Release))">true</WholeProgramOptimization>
++    <UseDebugLibraries Condition="$(Configuration.Contains(Debug))">true</UseDebugLibraries>
++    <UseDebugLibraries Condition="!$(Configuration.Contains(Debug))">false</UseDebugLibraries>
++  </PropertyGroup>
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
++  <ImportGroup Label="ExtensionSettings" />
++  <ImportGroup Label="PropertySheets">
++    <Import Project="$(SolutionDir)common\vsprops\common.props" />
++    <Import Project="$(SolutionDir)common\vsprops\BaseProperties.props" />
++    <Import Condition="$(Configuration.Contains(Debug))" Project="$(SolutionDir)common\vsprops\CodeGen_Debug.props" />
++    <Import Condition="$(Configuration.Contains(Devel))" Project="$(SolutionDir)common\vsprops\CodeGen_Devel.props" />
++    <Import Condition="$(Configuration.Contains(Release))" Project="$(SolutionDir)common\vsprops\CodeGen_Release.props" />
++    <Import Condition="!$(Configuration.Contains(Release))" Project="$(SolutionDir)common\vsprops\IncrementalLinking.props" />
++  </ImportGroup>
++  <PropertyGroup Label="UserMacros" />
++  <PropertyGroup>
++    <TargetName>pcsx2-stateconvert$(BuildString)</TargetName>
++  </PropertyGroup>
++  <ItemDefinitionGroup>
++    <ClCompile>
++      <AdditionalIncludeDirectories>$(SolutionDir)pcsx2;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(DepsIncludeDir)\plutovg;$(DepsIncludeDir)\plutosvg;$(DepsIncludeDir)\SDL3;$(DepsIncludeDir)\freetype2</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\include;$(SolutionDir)3rdparty\fmt\include;$(SolutionDir)3rdparty\winwil\include</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\libchdr\include;$(SolutionDir)3rdparty\cubeb\include;$(SolutionDir)3rdparty\imgui\include</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\simpleini\include;$(SolutionDir)3rdparty\libzip\msvc;$(SolutionDir)3rdparty\libzip\lib</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\cpuinfo\include;$(SolutionDir)3rdparty\fast_float\include</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\rcheevos\include;$(SolutionDir)3rdparty\rainterface;$(SolutionDir)3rdparty\soundtouch\soundtouch</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\discord-rpc\include;$(SolutionDir)3rdparty\jpgd;$(SolutionDir)3rdparty\ffmpeg\include</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\glad\include;$(SolutionDir)3rdparty\vulkan\include;$(SolutionDir)3rdparty\d3d12memalloc\include</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\lzma\include;$(SolutionDir)3rdparty\freesurround\include;$(SolutionDir)3rdparty\xbyak</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\zydis\include;$(SolutionDir)3rdparty\zydis\dependencies\zycore\include</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\demangler\include;$(SolutionDir)3rdparty\ccc\src</AdditionalIncludeDirectories>
++      <PreprocessorDefinitions>C4_NO_DEBUG_BREAK;ST_NO_EXCEPTION_HANDLING;D3D12MA_USING_DIRECTX_HEADERS;ENABLE_RAINTEGRATION;ENABLE_OPENGL;ENABLE_VULKAN;XBYAK_NO_EXCEPTION;ZYCORE_STATIC_BUILD;ZYDIS_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <PrecompiledHeader>NotUsing</PrecompiledHeader>
++    </ClCompile>
++    <Link>
++      <SubSystem>Console</SubSystem>
++      <AdditionalLibraryDirectories>$(DepsLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
++      <AdditionalDependencies>zstd.lib;z.lib;%(AdditionalDependencies)</AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
++  <ItemGroup>
++    <ProjectReference Include="$(SolutionDir)3rdparty\fmt\fmt.vcxproj">
++      <Project>{449ad25e-424a-4714-babc-68706cdcc33b}</Project>
++    </ProjectReference>
++    <ProjectReference Include="$(SolutionDir)3rdparty\libzip\libzip.vcxproj">
++      <Project>{20b2e9fe-f020-42a0-b324-956f5b06ea68}</Project>
++    </ProjectReference>
++    <ProjectReference Include="$(SolutionDir)common\common.vcxproj">
++      <Project>{4639972e-424e-4e13-8b07-ca403c481346}</Project>
++    </ProjectReference>
++  </ItemGroup>
++  <ItemGroup>
++    <ClCompile Include="main.cpp">
++      <ForcedIncludeFiles>$(SolutionDir)pcsx2\PrecompiledHeader.h</ForcedIncludeFiles>
++    </ClCompile>
++    <ClCompile Include="link_stubs.cpp">
++      <ForcedIncludeFiles>$(SolutionDir)pcsx2\PrecompiledHeader.h</ForcedIncludeFiles>
++    </ClCompile>
++    <ClCompile Include="$(SolutionDir)pcsx2\SaveStateLegacy.cpp">
++      <ForcedIncludeFiles>$(SolutionDir)pcsx2\PrecompiledHeader.h</ForcedIncludeFiles>
++    </ClCompile>
++  </ItemGroup>
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
++  <ImportGroup Label="ExtensionTargets" />
++</Project>
+diff --git a/pcsx2/SaveState.cpp b/pcsx2/SaveState.cpp
+index 239737c51..16e76069a 100644
+--- a/pcsx2/SaveState.cpp
++++ b/pcsx2/SaveState.cpp
+@@ -23,8 +23,10 @@
+ #include "SIO/Sio.h"
+ #include "SIO/Sio0.h"
+ #include "SIO/Sio2.h"
++#include "SPU2/defs.h"
+ #include "SPU2/spu2.h"
+ #include "SaveState.h"
++#include "SaveStateLegacy.h"
+ #include "StateWrapper.h"
+ #include "USB/USB.h"
+ #include "VMManager.h"
+@@ -1081,6 +1083,54 @@ bool SaveState_ReadScreenshot(const std::string& filename, u32* out_width, u32*
+ 	return SaveState_ReadScreenshot(zf.get(), out_width, out_height, out_pixels);
+ }
+ 
++// Experimental: legacy 0x9A4F/0x9A50/0x9A54/0x9A55 states are translated in memory (SaveStateLegacy.cpp) into
++// a complete native archive before PreLoadPrep(), so a state that cannot be fully translated
++// never touches the VM. The native load path below is then used unchanged.
++static bool ReadStateVersion(zip_t* zf, u32* version)
++{
++	auto zff = zip_fopen_managed(zf, EntryFilename_StateVersion, 0);
++	return zff && zip_fread(zff.get(), version, sizeof(*version)) == static_cast<zip_int64_t>(sizeof(*version));
++}
++
++// The translation module mirrors the private SPU2Savestate::DataBlock; refuse to use it if this
++// build's SPU2 block differs.
++static bool CheckLegacyTranslationLayout(Error* error)
++{
++	if (SaveStateLegacy::TargetSPU2Size() == static_cast<size_t>(SPU2Savestate::SizeIt()))
++		return true;
++	Error::SetStringFmt(error, "Legacy translation SPU2 layout ({} bytes) does not match this build ({} bytes).",
++		SaveStateLegacy::TargetSPU2Size(), SPU2Savestate::SizeIt());
++	return false;
++}
++
++bool SaveState_ConvertLegacy(const std::string& filename, const std::string& output, std::vector<std::string>* report, Error* error)
++{
++	if (!CheckLegacyTranslationLayout(error))
++		return false;
++
++	zip_error_t ze = {};
++	auto zf = zip_open_managed(filename.c_str(), ZIP_RDONLY, &ze);
++	if (!zf)
++	{
++		Error::SetStringFmt(error, "Failed to open '{}': {}", filename, zip_error_strerror(&ze));
++		return false;
++	}
++
++	SaveStateLegacy::ConvertedState state;
++	const bool converted = SaveStateLegacy::ConvertArchive(zf.get(), &state, error);
++	if (report)
++		*report = state.report.lines;
++	if (!converted)
++		return false;
++
++	if (!output.empty() && !SaveStateLegacy::WriteArchive(state, output.c_str(), error))
++		return false;
++
++	// Re-read the produced archive through the native entry validation as a consistency check.
++	auto native = SaveStateLegacy::OpenAsNativeArchive(state, error);
++	return static_cast<bool>(native);
++}
++
+ static bool CheckVersion(const std::string& filename, zip_t* zf, Error* error)
+ {
+ 	u32 savever;
+@@ -1177,12 +1227,29 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
+ 		return false;
+ 	}
+ 
++	// Experimental: translate a legacy state into a native in-memory archive first.
++	std::unique_ptr<SaveStateLegacy::ConvertedState> legacy;
++	std::unique_ptr<zip_t, void (*)(zip_t*)> translated(nullptr, [](zip_t*) {});
++	if (u32 savever = 0; ReadStateVersion(zf.get(), &savever) && SaveStateLegacy::IsLegacyVersion(savever))
++	{
++		if (!CheckLegacyTranslationLayout(error))
++			return false;
++		legacy = std::make_unique<SaveStateLegacy::ConvertedState>();
++		if (!SaveStateLegacy::ConvertArchive(zf.get(), legacy.get(), error))
++			return false;
++		translated = SaveStateLegacy::OpenAsNativeArchive(*legacy, error);
++		if (!translated)
++			return false;
++		Console.WriteLn(Color_StrongGreen, "Legacy save state translated; loading through the native path.");
++	}
++	zip_t* const archive = translated ? translated.get() : zf.get();
++
+ 	// look for version and screenshot information in the zip stream:
+-	if (!CheckVersion(filename, zf.get(), error))
++	if (!CheckVersion(filename, archive, error))
+ 		return false;
+ 
+ 	// check that all parts are included
+-	const s64 internal_index = CheckFileExistsInState(zf.get(), EntryFilename_InternalStructures, true);
++	const s64 internal_index = CheckFileExistsInState(archive, EntryFilename_InternalStructures, true);
+ 	s64 entryIndices[std::size(SavestateEntries)];
+ 
+ 	// Log any parts and pieces that are missing, and then generate an exception.
+@@ -1190,7 +1257,7 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
+ 	for (u32 i = 0; i < std::size(SavestateEntries); i++)
+ 	{
+ 		const bool required = SavestateEntries[i]->IsRequired();
+-		entryIndices[i] = CheckFileExistsInState(zf.get(), SavestateEntries[i]->GetFilename(), required);
++		entryIndices[i] = CheckFileExistsInState(archive, SavestateEntries[i]->GetFilename(), required);
+ 		if (entryIndices[i] < 0 && required)
+ 		{
+ 			allPresent = false;
+@@ -1205,7 +1272,7 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
+ 
+ 	PreLoadPrep();
+ 
+-	if (!LoadInternalStructuresState(zf.get(), internal_index, error))
++	if (!LoadInternalStructuresState(archive, internal_index, error))
+ 	{
+ 		if (!error->IsValid())
+ 			Error::SetString(error, "Save state corruption in internal structures.");
+@@ -1222,7 +1289,7 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
+ 			continue;
+ 		}
+ 
+-		auto zff = zip_fopen_index_managed(zf.get(), entryIndices[i], 0);
++		auto zff = zip_fopen_index_managed(archive, entryIndices[i], 0);
+ 		if (!zff || !SavestateEntries[i]->FreezeIn(zff.get()))
+ 		{
+ 			Error::SetString(error, fmt::format("Save state corruption in {}.", SavestateEntries[i]->GetFilename()));
+diff --git a/pcsx2/SaveState.h b/pcsx2/SaveState.h
+index b24870cef..0b44e3333 100644
+--- a/pcsx2/SaveState.h
++++ b/pcsx2/SaveState.h
+@@ -58,6 +58,8 @@ extern bool SaveState_ZipToDisk(
+ 	std::unique_ptr<ArchiveEntryList> srclist, std::unique_ptr<SaveStateScreenshotData> screenshot,
+ 	const char* filename, Error* error);
+ extern bool SaveState_ReadScreenshot(const std::string& filename, u32* out_width, u32* out_height, std::vector<u32>* out_pixels);
++// Experimental: translates a legacy 0x9A54 state. Writes a native archive when output is non-empty.
++bool SaveState_ConvertLegacy(const std::string& filename, const std::string& output, std::vector<std::string>* report, Error* error);
+ extern bool SaveState_UnzipFromDisk(const std::string& filename, Error* error);
+ 
+ // --------------------------------------------------------------------------------------
+diff --git a/pcsx2/SaveStateLegacy.cpp b/pcsx2/SaveStateLegacy.cpp
+new file mode 100644
+index 000000000..686963bf8
+--- /dev/null
++++ b/pcsx2/SaveStateLegacy.cpp
+@@ -0,0 +1,2257 @@
++// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
++// SPDX-License-Identifier: GPL-3.0+
++
++// Translates save-state format 0x9A54 (PCSX2 v2.4.0 / v2.5.x) into the native format of
++// this build (0x9A59, PCSX2 v2.8.2). The historical structure definitions below are
++// transcriptions of the headers at the v2.4.0 tag (identical at v2.5.258); their sizes are
++// pinned by static_asserts to the layouts measured with MSVC x64 from those headers.
++// Target layouts always come from this build's own headers.
++
++#include "SaveStateLegacy.h"
++
++#include "CDVD/CDVD.h"
++#include "CDVD/Ps1CD.h"
++#include "Counters.h"
++#include "GS.h"
++#include "Gif.h"
++#include "Gif_Unit.h"
++#include "IPU/IPU.h"
++#include "IPU/IPU_Fifo.h"
++#include "IPU/IPU_MultiISA.h"
++#include "IPU/IPUdma.h"
++#include "IopCounters.h"
++#include "IopMem.h"
++#include "MTVU.h"
++#include "Memory.h"
++#include "R3000A.h"
++#include "R5900.h"
++#include "SIO/Sio.h"
++#include "SIO/Sio0.h"
++#include "SIO/Sio2.h"
++#include "SPU2/defs.h"
++#include "SaveState.h"
++#include "Sif.h"
++#include "VU.h"
++#include "Vif.h"
++#include "Vif_Dma.h"
++#include "Vif_Dynarec.h"
++#include "ps2/BiosTools.h"
++
++#include "common/Console.h"
++#include "common/Error.h"
++#include "common/FileSystem.h"
++#include "common/Path.h"
++#include "common/StringUtil.h"
++#include "common/ZipHelpers.h"
++
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cstring>
++#include <optional>
++
++using namespace SaveStateLegacy;
++
++// --------------------------------------------------------------------------------------
++//  Historical (0x9A54) structure definitions
++// --------------------------------------------------------------------------------------
++namespace Legacy
++{
++	// pcsx2/R5900.h
++	struct cpuRegisters
++	{
++		GPRregs GPR;
++		GPR_reg HI;
++		GPR_reg LO;
++		CP0regs CP0;
++		u32 sa;
++		u32 IsDelaySlot;
++		u32 pc;
++		u32 code;
++		PERFregs PERF;
++		u32 eCycle[32];
++		u32 sCycle[32];
++		u32 cycle;
++		u32 interrupt;
++		int branch;
++		int opmode;
++		u32 tempcycles;
++		u32 dmastall;
++		u32 pcWriteback;
++		u32 nextEventCycle;
++		u32 lastEventCycle;
++		u32 lastCOP0Cycle;
++		u32 lastPERFCycle[2];
++	};
++	static_assert(sizeof(cpuRegisters) == 1008);
++	static_assert(offsetof(cpuRegisters, sCycle) == 832 && offsetof(cpuRegisters, nextEventCycle) == 988);
++
++	// pcsx2/R3000A.h
++	struct psxRegisters
++	{
++		GPRRegs GPR;
++		CP0Regs CP0;
++		CP2Data CP2D;
++		CP2Ctrl CP2C;
++		u32 pc;
++		u32 code;
++		u32 cycle;
++		u32 interrupt;
++		u32 pcWriteback;
++		u32 iopNextEventCycle;
++		s32 iopBreak;
++		s32 iopCycleEE;
++		u32 iopCycleEECarry;
++		u32 sCycle[32];
++		s32 eCycle[32];
++	};
++	static_assert(sizeof(psxRegisters) == 812);
++	static_assert(offsetof(psxRegisters, cycle) == 528 && offsetof(psxRegisters, sCycle) == 556);
++
++	// pcsx2/Counters.h
++	struct Counter
++	{
++		u32 count;
++		union
++		{
++			u32 modeval;
++			EECNT_MODE mode;
++		};
++		u32 target, hold;
++		u32 rate, interrupt;
++		u32 startCycle;
++	};
++	static_assert(sizeof(Counter) == 28);
++
++	struct SyncCounter
++	{
++		u32 Mode;
++		u32 startCycle;
++		s32 deltaCycles;
++	};
++	static_assert(sizeof(SyncCounter) == 12);
++
++	// pcsx2/IopCounters.h
++	struct psxCounter
++	{
++		u64 count, target;
++		u32 rate, interrupt;
++		u32 startCycle;
++		s32 deltaCycles;
++		psxCounterMode mode;
++		CounterIRQBehaviour currentIrqMode;
++	};
++	static_assert(sizeof(psxCounter) == 40);
++
++	// pcsx2/VU.h
++	struct fdivPipe
++	{
++		int enable;
++		REG_VI reg;
++		u32 sCycle;
++		u32 Cycle;
++		u32 statusflag;
++	};
++	static_assert(sizeof(fdivPipe) == 32);
++
++	struct efuPipe
++	{
++		int enable;
++		REG_VI reg;
++		u32 sCycle;
++		u32 Cycle;
++	};
++	static_assert(sizeof(efuPipe) == 28);
++
++	struct fmacPipe
++	{
++		u32 regupper;
++		u32 reglower;
++		int flagreg;
++		u32 xyzwupper;
++		u32 xyzwlower;
++		u32 sCycle;
++		u32 Cycle;
++		u32 macflag;
++		u32 statusflag;
++		u32 clipflag;
++	};
++	static_assert(sizeof(fmacPipe) == 40);
++
++	struct ialuPipe
++	{
++		int reg;
++		u32 sCycle;
++		u32 Cycle;
++	};
++	static_assert(sizeof(ialuPipe) == 12);
++
++	// pcsx2/R5900.h before 0x9A54 (v2.0.x, v2.2.0): the raw CP0 registers followed by values
++	// that WriteTLB() derived from them. 0x9A54 keeps only the raw registers.
++	struct tlbs9A50
++	{
++		u32 PageMask, EntryHi;
++		u32 EntryLo0, EntryLo1;
++		u32 Mask, nMask;
++		u32 G;
++		u32 ASID;
++		u32 VPN2;
++		u32 PFN0;
++		u32 PFN1;
++		u32 S;
++	};
++	static_assert(sizeof(tlbs9A50) == 48);
++
++	// SPU2 block, vuMicroFreeze payload and counter records are identical from 0x9A4F to 0x9A55.
++	static constexpr size_t VU_MICRO_SIZE = 2968;
++
++	// pcsx2/SPU2/defs.h. Nested types (volume, ADSR, gates, reverb, registers) are
++	// unchanged between the formats and are taken from this build.
++	//
++	// 0x9A54 (v2.4.0, v2.5.x): voices carry the deferred loop-start fields removed by 0f5ff686.
++	// 0x9A55 (v2.6.3): same mixer model without those fields; V_Core gains a pending KeyOff mask.
++	// Both still use the interpolation/fetch model (PV1..PV4, SCurrent) replaced at 0x9A57.
++#define LEGACY_V_VOICE_BODY \
++	V_VolumeSlideLR Volume; \
++	V_ADSR ADSR; \
++	u16 Pitch; \
++	u32 LoopStartA; \
++	u32 StartA; \
++	u32 NextA; \
++	s32 Prev1; \
++	s32 Prev2; \
++	bool Modulated; \
++	bool Noise; \
++	s8 LoopMode; \
++	s8 LoopFlags; \
++	s32 SP; \
++	s32 SPc; \
++	s32 PV4; \
++	s32 PV3; \
++	s32 PV2; \
++	s32 PV1; \
++	s32 OutX; \
++	s32 NextCrest; \
++	s16* SBuffer; \
++	s32 SCurrent;
++
++	struct V_Voice9A54
++	{
++		u32 PlayCycle;
++		u32 LoopCycle;
++		u32 PendingLoopStartA;
++		bool PendingLoopStart;
++		LEGACY_V_VOICE_BODY
++	};
++	static_assert(sizeof(V_Voice9A54) == 176);
++	static_assert(offsetof(V_Voice9A54, SP) == 124 && offsetof(V_Voice9A54, SBuffer) == 160 && offsetof(V_Voice9A54, SCurrent) == 168);
++
++	struct V_Voice9A55
++	{
++		LEGACY_V_VOICE_BODY
++	};
++	static_assert(sizeof(V_Voice9A55) == 160);
++	static_assert(offsetof(V_Voice9A55, SP) == 108 && offsetof(V_Voice9A55, SPc) == 112 && offsetof(V_Voice9A55, PV4) == 116 &&
++				  offsetof(V_Voice9A55, OutX) == 132 && offsetof(V_Voice9A55, NextCrest) == 136 &&
++				  offsetof(V_Voice9A55, SBuffer) == 144 && offsetof(V_Voice9A55, SCurrent) == 152);
++#undef LEGACY_V_VOICE_BODY
++
++#define LEGACY_V_CORE_BODY(VOICE) \
++	u32 Index; \
++	V_VoiceGates VoiceGates[::V_Core::NumVoices]; \
++	V_CoreGates DryGate; \
++	V_CoreGates WetGate; \
++	V_VolumeSlideLR MasterVol; \
++	V_VolumeLR ExtVol; \
++	V_VolumeLR InpVol; \
++	V_VolumeLR FxVol; \
++	VOICE Voices[::V_Core::NumVoices]; \
++	u32 IRQA; \
++	u32 TSA; \
++	u32 ActiveTSA; \
++	bool IRQEnable; \
++	bool FxEnable; \
++	bool Mute; \
++	bool AdmaInProgress; \
++	s8 DMABits; \
++	u8 NoiseClk; \
++	u32 NoiseCnt; \
++	u32 NoiseOut; \
++	u16 AutoDMACtrl; \
++	s32 DMAICounter; \
++	u32 LastClock; \
++	u32 InputDataLeft; \
++	u32 InputDataTransferred; \
++	u32 InputPosWrite; \
++	u32 InputDataProgress; \
++	V_Reverb Revb; \
++	s16 RevbDownBuf[2][64 * 2]; \
++	s16 RevbUpBuf[2][64 * 2]; \
++	u32 RevbSampleBufPos; \
++	u32 EffectsStartA; \
++	u32 EffectsEndA; \
++	V_CoreRegs Regs; \
++	StereoOut32 LastEffect; \
++	u8 CoreEnabled; \
++	u8 AttrBit0; \
++	u8 DmaMode; \
++	bool DmaStarted; \
++	u32 AutoDmaFree; \
++	u16* DMAPtr; \
++	u16* DMARPtr; \
++	u32 ReadSize; \
++	bool IsDMARead; \
++	u32 KeyOn;
++
++	struct V_Core9A54
++	{
++		LEGACY_V_CORE_BODY(V_Voice9A54)
++		u16 psxSoundDataTransferControl;
++		u16 psxSPUSTAT;
++	};
++	static_assert(sizeof(V_Core9A54) == 6000);
++	static_assert(offsetof(V_Core9A54, Voices) == 488 && offsetof(V_Core9A54, LastClock) == 4748);
++
++	struct V_Core9A55
++	{
++		LEGACY_V_CORE_BODY(V_Voice9A55)
++		u32 KeyOff;
++		u16 psxSoundDataTransferControl;
++		u16 psxSPUSTAT;
++	};
++	static_assert(sizeof(V_Core9A55) == 5624);
++	static_assert(offsetof(V_Core9A55, Voices) == 488 && offsetof(V_Core9A55, LastClock) == 4364);
++#undef LEGACY_V_CORE_BODY
++
++	// pcsx2/SPU2/spu2freeze.cpp
++	template <typename Core>
++	struct DataBlock
++	{
++		u32 spu2id;
++		u8 unkregs[0x10000];
++		u8 mem[0x200000];
++		u32 version;
++		Core Cores[2];
++		V_SPDIF Spdif;
++		u16 OutPos;
++		u16 InputPos;
++		u32 Cycles;
++		u32 lClocks;
++		int PlayMode;
++	};
++	using DataBlock9A54 = DataBlock<V_Core9A54>;
++	using DataBlock9A55 = DataBlock<V_Core9A55>;
++	static_assert(sizeof(DataBlock9A54) == 2174728);
++	static_assert(offsetof(DataBlock9A54, Cores) == 2162696 && offsetof(DataBlock9A54, lClocks) == 2174720);
++	static_assert(sizeof(DataBlock9A55) == 2173976);
++	static_assert(offsetof(DataBlock9A55, Cores) == 2162696 && offsetof(DataBlock9A55, Spdif) == 2173944 &&
++				  offsetof(DataBlock9A55, lClocks) == 2173968);
++} // namespace Legacy
++
++namespace Target
++{
++	// Mirror of SPU2Savestate::DataBlock in pcsx2/SPU2/spu2freeze.cpp (private to that file).
++	// Pinned to the measured v2.8.2 size here; the emulator additionally compares it with
++	// SPU2Savestate::SizeIt() before loading (SaveState.cpp).
++	struct DataBlock
++	{
++		u32 spu2id;
++		u8 unkregs[0x10000];
++		u8 mem[0x200000];
++		u32 version;
++		V_Core Cores[2];
++		V_SPDIF Spdif;
++		u16 OutPos;
++		u16 InputPos;
++		u32 Cycles;
++		u64 lClocks;
++		int PlayMode;
++	};
++	static_assert(sizeof(DataBlock) == 2178992 && offsetof(DataBlock, lClocks) == 2178976);
++} // namespace Target
++
++// Target-side layout facts this translation depends on.
++static_assert(sizeof(cpuRegisters) == 1160 && offsetof(cpuRegisters, sCycle) == 832 &&
++			  offsetof(cpuRegisters, cycle) == 1088 && offsetof(cpuRegisters, nextEventCycle) == 1120);
++static_assert(offsetof(cpuRegisters, eCycle) == offsetof(Legacy::cpuRegisters, eCycle));
++static_assert(sizeof(psxRegisters) == 952 && offsetof(psxRegisters, cycle) == 528 && offsetof(psxRegisters, sCycle) == 568);
++static_assert(sizeof(Counter) == 32 && sizeof(SyncCounter) == 24 && sizeof(psxCounter) == 48);
++static_assert(sizeof(fdivPipe) == 40 && sizeof(efuPipe) == 40 && sizeof(fmacPipe) == 48 && sizeof(ialuPipe) == 24);
++static_assert(sizeof(V_Voice) == 264 && sizeof(V_Core) == 8128);
++static_assert(sizeof(tlbs) == 16 && sizeof(cachedTlbs_t) == 976 && std::size(tlb) == 48);
++static_assert(offsetof(V_Core, Voices) == offsetof(Legacy::V_Core9A54, Voices) &&
++			  offsetof(V_Core, Voices) == offsetof(Legacy::V_Core9A55, Voices));
++static_assert(std::is_same_v<decltype(EEoCycle), u64> && std::is_same_v<decltype(nextStartCounter), u64> &&
++			  std::is_same_v<decltype(psxNextStartCounter), u64>);
++static_assert(std::is_same_v<decltype(EEsCycle), s32> && std::is_same_v<decltype(nextDeltaCounter), s32> &&
++			  std::is_same_v<decltype(psxNextDeltaCounter), s32>);
++
++namespace
++{
++	static constexpr u32 SPU2_SAVE_ID = 0x1227521; // SPU2Savestate::SAVE_ID
++	static constexpr u32 SPU2_SAVE_VERSION = 0x000e; // SPU2Savestate::SAVE_VERSION (same in both formats)
++
++	// pcsx2/SPU2/Mixer.cpp
++	static constexpr int XAFLAG_LOOP_END = 1 << 0;
++
++	// Sizes of file-local (static) variables that cannot be named from this translation unit.
++	// Each is followed in the stream by a tag or a validated structure, which catches drift.
++	static constexpr size_t VSYNC_TIMING_INFO_SIZE = 40; // Counters.cpp: vSyncTimingInfo (double, int enum, 7 x u32)
++	// Memory.cpp: u16 s_ba[0xff], u16 s_dve_regs[0xff], bool s_ba_command_executing,
++	// bool s_ba_error_detected, u16 s_ba_current_reg, bool extra_memory.
++	static constexpr size_t MEMORY_FREEZE_SIZE = 2 * 0xff * sizeof(u16) + 2 * sizeof(bool) + sizeof(u16) + sizeof(bool);
++	static_assert(MEMORY_FREEZE_SIZE == 1025);
++	// x86/microVU_IR.h: static_assert(sizeof(microRegInfo) == 96); the header defines microVU0/1
++	// and cannot be included here. vuJITFreeze writes microVU0/1.prog.lpState.
++	static constexpr size_t MICRO_REG_INFO_SIZE = 96;
++	static constexpr size_t SPR_FREEZE_SIZE = sizeof(bool) * 2 + sizeof(u32); // SPR.cpp: spr0finished, spr1finished, mfifotransferred
++	static constexpr size_t DECI2_FREEZE_SIZE = sizeof(u32) * 2 + 256; // R5900OpcodeImpl.cpp: deci2addr, deci2handler, deci2buffer
++
++	// Sequential reader of the legacy stream with a parallel writer for the target stream.
++	class Translator
++	{
++	public:
++		Translator(std::span<const u8> src, std::vector<u8>& dst, Report& report)
++			: m_src(src)
++			, m_dst(dst)
++			, m_report(report)
++		{
++		}
++
++		size_t Pos() const { return m_pos; }
++		size_t OutPos() const { return m_dst.size(); }
++		size_t Remaining() const { return m_src.size() - m_pos; }
++
++		const u8* Peek(size_t count) const { return (count <= Remaining()) ? (m_src.data() + m_pos) : nullptr; }
++
++		bool Take(void* out, size_t count)
++		{
++			if (count > Remaining())
++				return false;
++			std::memcpy(out, m_src.data() + m_pos, count);
++			m_pos += count;
++			return true;
++		}
++
++		template <typename T>
++		bool Read(T& value)
++		{
++			return Take(&value, sizeof(T));
++		}
++
++		void Put(const void* data, size_t count)
++		{
++			const u8* bytes = static_cast<const u8*>(data);
++			m_dst.insert(m_dst.end(), bytes, bytes + count);
++		}
++
++		template <typename T>
++		void Write(const T& value)
++		{
++			Put(&value, sizeof(T));
++		}
++
++		bool Copy(size_t count)
++		{
++			if (count > Remaining())
++				return false;
++			Put(m_src.data() + m_pos, count);
++			m_pos += count;
++			return true;
++		}
++
++		bool Tag(const char* name)
++		{
++			char expected[32] = {};
++			StringUtil::Strlcpy(expected, name, sizeof(expected));
++			const u8* actual = Peek(sizeof(expected));
++			if (!actual || std::memcmp(actual, expected, sizeof(expected)) != 0)
++				return false;
++			return Copy(sizeof(expected));
++		}
++
++		void Section(const char* name, size_t src_start, size_t dst_start, const char* action)
++		{
++			m_report.Add("  {:<28} source {:>8} +{:<7} target {:>8} +{:<7} {}", name, src_start, m_pos - src_start,
++				dst_start, m_dst.size() - dst_start, action);
++		}
++
++	private:
++		std::span<const u8> m_src;
++		size_t m_pos = 0;
++		std::vector<u8>& m_dst;
++		Report& m_report;
++	};
++
++	// Walks a StateWrapper-encoded region without interpreting it, to find its length.
++	class WrapperWalker
++	{
++	public:
++		WrapperWalker(const u8* data, size_t size)
++			: m_data(data)
++			, m_size(size)
++		{
++		}
++
++		bool Skip(size_t count)
++		{
++			if (count > m_size - m_pos)
++				return false;
++			m_pos += count;
++			return true;
++		}
++
++		bool U32(u32* value)
++		{
++			if (sizeof(u32) > m_size - m_pos)
++				return false;
++			std::memcpy(value, m_data + m_pos, sizeof(u32));
++			m_pos += sizeof(u32);
++			return true;
++		}
++
++		bool Marker(const char* name)
++		{
++			u32 length;
++			if (!U32(&length) || length != std::strlen(name) || length > m_size - m_pos)
++				return false;
++			if (std::memcmp(m_data + m_pos, name, length) != 0)
++				return false;
++			m_pos += length;
++			return true;
++		}
++
++		bool ByteDeque(size_t limit)
++		{
++			u32 length;
++			return U32(&length) && length <= limit && Skip(length);
++		}
++
++		size_t Pos() const { return m_pos; }
++
++	private:
++		const u8* m_data;
++		size_t m_size;
++		size_t m_pos = 0;
++	};
++
++	template <typename T>
++	constexpr size_t SizeOf()
++	{
++		if constexpr (std::is_same_v<T, bool>)
++			return 1; // StateWrapper::Do(bool*) writes one byte.
++		else if constexpr (std::is_enum_v<T>)
++			return sizeof(std::underlying_type_t<T>);
++		else
++			return sizeof(T);
++	}
++
++	static void ConvertCpuRegisters(const Legacy::cpuRegisters& o, cpuRegisters& n, const CycleDomain& ee)
++	{
++		std::memset(&n, 0, sizeof(n));
++		n.GPR = o.GPR;
++		n.HI = o.HI;
++		n.LO = o.LO;
++		n.CP0 = o.CP0;
++		n.sa = o.sa;
++		n.IsDelaySlot = o.IsDelaySlot;
++		n.pc = o.pc;
++		n.code = o.code;
++		n.PERF = o.PERF;
++		std::memcpy(n.eCycle, o.eCycle, sizeof(n.eCycle));
++		for (size_t i = 0; i < std::size(n.sCycle); i++)
++			n.sCycle[i] = ((o.interrupt >> i) & 1) ? ee.Past(o.sCycle[i]) : ee.PastInactive(o.sCycle[i]);
++		n.cycle = ee.now64;
++		n.interrupt = o.interrupt;
++		n.branch = o.branch;
++		n.opmode = o.opmode;
++		n.tempcycles = o.tempcycles;
++		n.dmastall = o.dmastall;
++		n.pcWriteback = o.pcWriteback;
++		n.nextEventCycle = ee.Near(o.nextEventCycle);
++		n.lastEventCycle = ee.Past(o.lastEventCycle);
++		n.lastCOP0Cycle = ee.Past(o.lastCOP0Cycle);
++		n.lastPERFCycle[0] = ee.Past(o.lastPERFCycle[0]);
++		n.lastPERFCycle[1] = ee.Past(o.lastPERFCycle[1]);
++	}
++
++	// COP0.cpp (0x9A54+): page mask -> address mask used by the EE cache lookup.
++	static u32 ConvertPageMask(u32 page_mask)
++	{
++		const u32 bits = static_cast<u32>(std::popcount(page_mask >> 13));
++		return (1u << (12 + bits)) - 1;
++	}
++
++	// 0x9A54 keeps only the raw TLB registers and serializes a list of the cached mappings
++	// (cachedTlbs). Rebuild each entry and the list exactly as WriteTLB() (COP0.cpp, v2.4.0+)
++	// does when the game writes an entry: scratchpad entries become cached, reserved cache
++	// modes become uncached, and every valid cached non-scratchpad entry gets one record.
++	static void UpgradeTlb(const Legacy::tlbs9A50* o, tlbs* n, cachedTlbs_t& cache, int* normalized)
++	{
++		std::memset(static_cast<void*>(&cache), 0, sizeof(cache));
++		*normalized = 0;
++		for (size_t i = 0; i < std::size(tlb); i++)
++		{
++			tlbs& e = n[i];
++			std::memset(static_cast<void*>(&e), 0, sizeof(e));
++			e.PageMask.UL = o[i].PageMask;
++			e.EntryHi.UL = o[i].EntryHi;
++			e.EntryLo0.UL = o[i].EntryLo0;
++			e.EntryLo1.UL = o[i].EntryLo1;
++
++			const u32 lo0 = e.EntryLo0.UL, lo1 = e.EntryLo1.UL;
++			if (e.isSPR())
++			{
++				e.EntryLo0.C = 3;
++				e.EntryLo1.C = 3;
++			}
++			else
++			{
++				if (!e.EntryLo0.isValidCacheMode())
++					e.EntryLo0.C = 2;
++				if (!e.EntryLo1.isValidCacheMode())
++					e.EntryLo1.C = 2;
++			}
++			if (e.EntryLo0.UL != lo0 || e.EntryLo1.UL != lo1)
++				(*normalized)++;
++
++			if (!e.isSPR() && ((e.EntryLo0.V && e.EntryLo0.isCached()) || (e.EntryLo1.V && e.EntryLo1.isCached())))
++			{
++				const size_t idx = cache.count;
++				cache.CacheEnabled0[idx] = e.EntryLo0.isCached() ? ~0u : 0u;
++				cache.CacheEnabled1[idx] = e.EntryLo1.isCached() ? ~0u : 0u;
++				cache.PFN1s[idx] = e.PFN1();
++				cache.PFN0s[idx] = e.PFN0();
++				cache.PageMasks[idx] = ConvertPageMask(e.PageMask.UL);
++				cache.count++;
++			}
++		}
++	}
++
++	static void ConvertPsxRegisters(const Legacy::psxRegisters& o, psxRegisters& n, const CycleDomain& iop)
++	{
++		std::memset(&n, 0, sizeof(n));
++		n.GPR = o.GPR;
++		n.CP0 = o.CP0;
++		n.CP2D = o.CP2D;
++		n.CP2C = o.CP2C;
++		n.pc = o.pc;
++		n.code = o.code;
++		n.cycle = iop.now64;
++		n.interrupt = o.interrupt;
++		n.pcWriteback = o.pcWriteback;
++		n.iopNextEventCycle = iop.Near(o.iopNextEventCycle);
++		n.iopBreak = o.iopBreak;
++		n.iopCycleEE = o.iopCycleEE;
++		n.iopCycleEECarry = o.iopCycleEECarry;
++		for (size_t i = 0; i < std::size(n.sCycle); i++)
++			n.sCycle[i] = ((o.interrupt >> i) & 1) ? iop.Past(o.sCycle[i]) : iop.PastInactive(o.sCycle[i]);
++		std::memcpy(n.eCycle, o.eCycle, sizeof(n.eCycle));
++	}
++
++	// Translates one VU's portion of vuMicroFreeze (VUmicroMem.cpp). The freeze order is
++	// identical at v2.4.0, v2.5.258 and v2.8.2; only the field widths differ.
++	static bool ConvertVuMicro(Translator& t, bool vu1, const CycleDomain& ee)
++	{
++		auto copy = [&](size_t size) { return t.Copy(size); };
++#define COPY_FIELD(member) \
++	if (!copy(sizeof(VURegs::member))) \
++		return false;
++
++		COPY_FIELD(ACC);
++		COPY_FIELD(VF);
++		COPY_FIELD(VI);
++		COPY_FIELD(q);
++		if (vu1)
++			COPY_FIELD(p);
++
++		u32 cycle32;
++		if (!t.Read(cycle32))
++			return false;
++		// VU time runs on the EE clock and may be slightly ahead of or behind the EE.
++		const u64 cycle64 = ee.Near(cycle32);
++		t.Write(static_cast<decltype(VURegs::cycle)>(cycle64));
++
++		COPY_FIELD(flags);
++		COPY_FIELD(code);
++		COPY_FIELD(start_pc);
++		COPY_FIELD(branch);
++		COPY_FIELD(branchpc);
++		COPY_FIELD(delaybranchpc);
++		COPY_FIELD(takedelaybranch);
++		COPY_FIELD(ebit);
++		COPY_FIELD(pending_q);
++		COPY_FIELD(pending_p);
++		COPY_FIELD(micro_macflags);
++		COPY_FIELD(micro_clipflags);
++		COPY_FIELD(micro_statusflags);
++		COPY_FIELD(macflag);
++		COPY_FIELD(statusflag);
++		COPY_FIELD(clipflag);
++
++		// A cycle count (not a timestamp): sign-extend.
++		s32 next_block_cycles;
++		if (!t.Read(next_block_cycles))
++			return false;
++		t.Write(static_cast<decltype(VURegs::nextBlockCycles)>(next_block_cycles));
++
++		if (vu1)
++		{
++			COPY_FIELD(xgkickaddr);
++			COPY_FIELD(xgkickdiff);
++			COPY_FIELD(xgkicksizeremaining);
++			u32 xgkick_last32;
++			if (!t.Read(xgkick_last32))
++				return false;
++			t.Write(static_cast<decltype(VURegs::xgkicklastcycle)>(ee.Near(xgkick_last32)));
++			COPY_FIELD(xgkickcyclecount);
++			COPY_FIELD(xgkickenable);
++			COPY_FIELD(xgkickendpacket);
++		}
++
++		COPY_FIELD(VIBackupCycles);
++		COPY_FIELD(VIOldValue);
++		COPY_FIELD(VIRegNumber);
++
++		// Pipeline start cycles are relative to this VU's own cycle counter.
++		auto pipe_cycle = [&](u32 value) { return CycleDomain::NearTo(cycle64, cycle32, value); };
++
++		for (size_t i = 0; i < std::extent_v<decltype(VURegs::fmac)>; i++)
++		{
++			Legacy::fmacPipe o;
++			if (!t.Read(o))
++				return false;
++			fmacPipe n = {};
++			n.regupper = o.regupper;
++			n.reglower = o.reglower;
++			n.flagreg = o.flagreg;
++			n.xyzwupper = o.xyzwupper;
++			n.xyzwlower = o.xyzwlower;
++			n.sCycle = pipe_cycle(o.sCycle);
++			n.Cycle = o.Cycle;
++			n.macflag = o.macflag;
++			n.statusflag = o.statusflag;
++			n.clipflag = o.clipflag;
++			t.Write(n);
++		}
++		COPY_FIELD(fmacreadpos);
++		COPY_FIELD(fmacwritepos);
++		COPY_FIELD(fmaccount);
++
++		{
++			Legacy::fdivPipe o;
++			if (!t.Read(o))
++				return false;
++			fdivPipe n = {};
++			n.enable = o.enable;
++			n.reg = o.reg;
++			n.sCycle = pipe_cycle(o.sCycle);
++			n.Cycle = o.Cycle;
++			n.statusflag = o.statusflag;
++			t.Write(n);
++		}
++		{
++			Legacy::efuPipe o;
++			if (!t.Read(o))
++				return false;
++			efuPipe n = {};
++			n.enable = o.enable;
++			n.reg = o.reg;
++			n.sCycle = pipe_cycle(o.sCycle);
++			n.Cycle = o.Cycle;
++			t.Write(n);
++		}
++		for (size_t i = 0; i < std::extent_v<decltype(VURegs::ialu)>; i++)
++		{
++			Legacy::ialuPipe o;
++			if (!t.Read(o))
++				return false;
++			ialuPipe n = {};
++			n.reg = o.reg;
++			n.sCycle = pipe_cycle(o.sCycle);
++			n.Cycle = o.Cycle;
++			t.Write(n);
++		}
++		COPY_FIELD(ialureadpos);
++		COPY_FIELD(ialuwritepos);
++		COPY_FIELD(ialucount);
++#undef COPY_FIELD
++		return true;
++	}
++} // namespace
++
++void SaveStateLegacy::Report::Add(std::string line)
++{
++	if (echo_to_console)
++		Console.WriteLn(line);
++	lines.push_back(std::move(line));
++}
++
++bool SaveStateLegacy::IsLegacyVersion(u32 savever)
++{
++	return std::find(std::begin(SourceFormats), std::end(SourceFormats), static_cast<u16>(savever >> 16)) !=
++		   std::end(SourceFormats);
++}
++
++// Walks a legacy Internal Structures stream section by section.
++//   widen = true : 0x9A54/0x9A55 stream -> this build's layout (64-bit cycle counters).
++//   widen = false: 0x9A4F/0x9A50 stream -> 0x9A54 layout (cycle fields copied unchanged).
++// format is the layout of `src`; the pre-0x9A54 differences are handled where they occur.
++static bool TranslateInternals(std::span<const u8> src, std::vector<u8>& dst, Context& ctx, Report& report, Error* error,
++	u16 format, bool widen)
++{
++	dst.clear();
++	dst.reserve(src.size() + 4096);
++	Translator t(src, dst, report);
++	const bool pre_9a54 = format < 0x9A54;
++
++	auto fail = [&](std::string_view what) {
++		const std::string message = fmt::format("Legacy Internal Structures: {} at source offset {}.", what, t.Pos());
++		report.Add(message);
++		Error::SetString(error, message);
++		return false;
++	};
++
++	if (widen)
++		report.Add("Internal Structures ({} bytes):", src.size());
++	else
++		report.Add("Internal Structures ({} bytes, 0x{:04X}) -> 0x9A54 layout:", src.size(), format);
++	size_t s0, d0;
++
++	// --- SaveStateBase::FreezeBios -----------------------------------------------------
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Tag("BIOS"))
++		return fail("missing BIOS tag");
++	if (!t.Copy(sizeof(u32) + 256))
++		return fail("truncated BIOS record");
++	t.Section("BIOS", s0, d0, "copied");
++
++	// --- SaveStateBase::vmFreeze (VMManager.cpp) ----------------------------------------
++	s0 = t.Pos(), d0 = t.OutPos();
++	{
++		u32 crc, length;
++		if (!t.Read(crc) || !t.Read(length))
++			return fail("truncated VM metadata");
++		const u8* text = t.Peek(static_cast<size_t>(length) + 1);
++		if (!text || text[length] > 1)
++			return fail("invalid ELF path record");
++		t.Write(crc);
++		t.Write(length);
++		t.Copy(static_cast<size_t>(length) + 1);
++		report.Add("    game CRC {:08X}, ELF '{}'", crc, std::string_view(reinterpret_cast<const char*>(text), length));
++	}
++	t.Section("VM metadata", s0, d0, "copied");
++
++	// --- cpuRegs block -------------------------------------------------------------------
++	if (!t.Tag("cpuRegs"))
++		return fail("missing cpuRegs tag");
++	{
++		s0 = t.Pos(), d0 = t.OutPos();
++		if (widen)
++		{
++			auto ocpu = std::make_unique<Legacy::cpuRegisters>();
++			auto opsx = std::make_unique<Legacy::psxRegisters>();
++			if (!t.Read(*ocpu) || !t.Read(*opsx))
++				return fail("truncated EE/IOP registers");
++			ctx.ee.Set(ocpu->cycle);
++			ctx.iop.Set(opsx->cycle);
++			ctx.cycles_known = true;
++
++			auto ncpu = std::make_unique<cpuRegisters>();
++			auto npsx = std::make_unique<psxRegisters>();
++			ConvertCpuRegisters(*ocpu, *ncpu, ctx.ee);
++			ConvertPsxRegisters(*opsx, *npsx, ctx.iop);
++			t.Write(*ncpu);
++			t.Write(*npsx);
++			t.Section("EE + IOP registers", s0, d0, "converted (64-bit cycles)");
++			report.Add("    EE cycle {:08X} -> {:016X}, IOP cycle {:08X} -> {:016X}", ctx.ee.now32, ctx.ee.now64,
++				ctx.iop.now32, ctx.iop.now64);
++		}
++		else
++		{
++			if (!t.Copy(sizeof(Legacy::cpuRegisters) + sizeof(Legacy::psxRegisters)))
++				return fail("truncated EE/IOP registers");
++			t.Section("EE + IOP registers", s0, d0, "copied");
++		}
++
++		s0 = t.Pos(), d0 = t.OutPos();
++		if (!pre_9a54)
++		{
++			if (!t.Copy(sizeof(fpuRegs) + sizeof(tlb) + sizeof(cachedTlbs) + sizeof(AllowParams1) + sizeof(AllowParams2)))
++				return fail("truncated FPU/TLB records");
++			t.Section("FPU, TLB, BIOS params", s0, d0, "copied");
++		}
++		else
++		{
++			if (!t.Copy(sizeof(fpuRegs)))
++				return fail("truncated FPU registers");
++			std::array<Legacy::tlbs9A50, std::size(tlb)> old;
++			if (!t.Read(old))
++				return fail("truncated TLB entries");
++			std::array<tlbs, std::size(tlb)> upgraded;
++			cachedTlbs_t cache;
++			int normalized;
++			UpgradeTlb(old.data(), upgraded.data(), cache, &normalized);
++			t.Write(upgraded);
++			t.Write(cache);
++			if (!t.Copy(sizeof(AllowParams1) + sizeof(AllowParams2)))
++				return fail("truncated BIOS parameters");
++			t.Section("FPU, TLB, BIOS params", s0, d0, "TLB rewritten, cached-TLB list rebuilt");
++			report.Add("    {} TLB entries had their cache mode normalized; {} cached mappings listed", normalized, cache.count);
++		}
++	}
++
++	// --- Cycles block --------------------------------------------------------------------
++	if (!t.Tag("Cycles"))
++		return fail("missing Cycles tag");
++	if (!widen)
++	{
++		s0 = t.Pos(), d0 = t.OutPos();
++		if (!t.Copy(6 * sizeof(u32)))
++			return fail("truncated cycle timers");
++		t.Section("cycle timers", s0, d0, "copied");
++	}
++	else
++	{
++		s0 = t.Pos(), d0 = t.OutPos();
++		s32 ee_s, next_delta, psx_next_delta;
++		u32 ee_o, next_start, psx_next_start;
++		if (!t.Read(ee_s) || !t.Read(ee_o) || !t.Read(next_delta) || !t.Read(next_start) || !t.Read(psx_next_start) ||
++			!t.Read(psx_next_delta))
++		{
++			return fail("truncated cycle timers");
++		}
++		t.Write(ee_s);
++		t.Write(ctx.ee.Past(ee_o));
++		t.Write(next_delta);
++		t.Write(ctx.ee.Past(next_start));
++		t.Write(ctx.iop.Past(psx_next_start));
++		t.Write(psx_next_delta);
++		t.Section("cycle timers", s0, d0, "converted");
++	}
++
++	// --- EE subsystems -------------------------------------------------------------------
++	if (!t.Tag("EE-Subsystems"))
++		return fail("missing EE-Subsystems tag");
++
++	// rcntFreeze (Counters.cpp)
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!widen)
++	{
++		if (!t.Copy(std::size(counters) * sizeof(Legacy::Counter) + 2 * sizeof(Legacy::SyncCounter) + sizeof(s32) + sizeof(u32)))
++			return fail("truncated EE counters");
++	}
++	else
++	{
++	for (size_t i = 0; i < std::size(counters); i++)
++	{
++		Legacy::Counter o;
++		if (!t.Read(o))
++			return fail("truncated EE counter");
++		Counter n;
++		std::memset(&n, 0, sizeof(n));
++		n.count = o.count;
++		n.modeval = o.modeval;
++		n.target = o.target;
++		n.hold = o.hold;
++		n.rate = o.rate;
++		n.interrupt = o.interrupt;
++		n.startCycle = ctx.ee.Past(o.startCycle);
++		t.Write(n);
++	}
++	for (int i = 0; i < 2; i++)
++	{
++		Legacy::SyncCounter o;
++		if (!t.Read(o))
++			return fail("truncated EE sync counter");
++		SyncCounter n;
++		std::memset(&n, 0, sizeof(n));
++		n.Mode = o.Mode;
++		n.startCycle = ctx.ee.Past(o.startCycle);
++		n.deltaCycles = o.deltaCycles;
++		t.Write(n);
++	}
++	{
++		s32 delta;
++		u32 start;
++		if (!t.Read(delta) || !t.Read(start))
++			return fail("truncated EE counter schedule");
++		t.Write(delta);
++		t.Write(ctx.ee.Past(start));
++	}
++	} // widen
++	if (!t.Copy(VSYNC_TIMING_INFO_SIZE + sizeof(gsVideoMode) + sizeof(gsIsInterlaced)))
++		return fail("truncated video timing record");
++	t.Section("EE counters", s0, d0, widen ? "converted" : "copied");
++
++	// memFreeze (Memory.cpp) and gsFreeze (GS.cpp)
++	s0 = t.Pos(), d0 = t.OutPos();
++	{
++		const u8* mem = t.Peek(MEMORY_FREEZE_SIZE);
++		if (!mem)
++			return fail("truncated memory controller record");
++		if (mem[MEMORY_FREEZE_SIZE - 1] > 1)
++			return fail("invalid extra-memory flag");
++		if (mem[MEMORY_FREEZE_SIZE - 1])
++			report.Add("    state requires 128MB extra memory to be enabled in the target VM");
++		t.Copy(MEMORY_FREEZE_SIZE);
++	}
++	t.Section("memory controller", s0, d0, "copied");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(Ps2MemSize::GSregs + sizeof(gsVideoMode)))
++		return fail("truncated GS register image");
++	t.Section("GS registers", s0, d0, "copied");
++
++	// vuMicroFreeze (VUmicroMem.cpp)
++	if (!t.Tag("vuMicroRegs"))
++		return fail("missing vuMicroRegs tag (EE counter/memory layout mismatch)");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!widen)
++	{
++		if (!t.Copy(Legacy::VU_MICRO_SIZE))
++			return fail("truncated VU registers");
++		t.Section("VU0 + VU1 registers", s0, d0, "copied");
++	}
++	else
++	{
++		if (!ConvertVuMicro(t, false, ctx.ee) || !ConvertVuMicro(t, true, ctx.ee))
++			return fail("truncated VU registers");
++		t.Section("VU0 + VU1 registers", s0, d0, "converted (64-bit cycles)");
++	}
++
++	// vuJITFreeze (x86/microVU.cpp)
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(2 * MICRO_REG_INFO_SIZE))
++		return fail("truncated microVU state");
++	t.Section("microVU block state", s0, d0, "copied");
++
++	// vif0Freeze / vif1Freeze (Vif.cpp)
++	for (int i = 0; i < 2; i++)
++	{
++		if (!t.Tag(i == 0 ? "VIF0dma" : "VIF1dma"))
++			return fail(i == 0 ? "missing VIF0dma tag (VU layout mismatch)" : "missing VIF1dma tag");
++		s0 = t.Pos(), d0 = t.OutPos();
++		if (!t.Copy(sizeof(g_vif0Cycles) + sizeof(vifStruct)))
++			return fail("truncated VIF registers");
++		u32 buffered;
++		if (!t.Read(buffered))
++			return fail("truncated VIF buffer length");
++		if (buffered > sizeof(nVif[0].buffer))
++			return fail(fmt::format("VIF buffer length {} exceeds {}", buffered, sizeof(nVif[0].buffer)));
++		t.Write(buffered);
++		if (!t.Copy(buffered))
++			return fail("truncated VIF buffer");
++		t.Section(i == 0 ? "VIF0" : "VIF1", s0, d0, "copied");
++	}
++
++	// sifFreeze (Sif.cpp)
++	if (!t.Tag("SIFdma"))
++		return fail("missing SIFdma tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(sizeof(sif0) + sizeof(sif1)))
++		return fail("truncated SIF channels");
++	t.Section("SIF", s0, d0, "copied");
++
++	// ipuFreeze (IPU/IPU.cpp)
++	if (!t.Tag("IPU"))
++		return fail("missing IPU tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(sizeof(ipu_fifo) + sizeof(g_BP) + sizeof(g_ipu_vqclut) + sizeof(g_ipu_thresh) +
++				sizeof(coded_block_pattern) + sizeof(decoder) + sizeof(ipu_cmd) + sizeof(IPUCoreStatus)))
++	{
++		return fail("truncated IPU state");
++	}
++	t.Section("IPU", s0, d0, "copied");
++
++	// ipuDmaFreeze (IPU/IPUdma.cpp)
++	if (!t.Tag("IPUdma"))
++		return fail("missing IPUdma tag (IPU layout mismatch)");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(sizeof(IPU1Status)))
++		return fail("truncated IPU DMA state");
++	t.Section("IPU DMA", s0, d0, "copied");
++
++	// gifFreeze / gifPathFreeze (Gif_Unit.cpp)
++	if (!t.Tag("Gif Unit"))
++		return fail("missing Gif Unit tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(sizeof(bool) + sizeof(gifUnit.stat) + sizeof(gifUnit.gsSIGNAL) + sizeof(gifUnit.gsFINISH) +
++				sizeof(gifUnit.lastTranType)))
++	{
++		return fail("truncated GIF unit");
++	}
++	for (int path = 0; path < 3; path++)
++	{
++		constexpr size_t path_size = sizeof(Gif_Path) - sizeof(Gif_Path_MTVU);
++		if (!t.Copy(sizeof(Gif_Path_MTVU::fakePackets)))
++			return fail("truncated GIF path");
++		const u8* raw = t.Peek(path_size);
++		if (!raw)
++			return fail("truncated GIF path");
++		u32 buff_size, cur_size;
++		std::memcpy(&buff_size, raw + offsetof(Gif_Path, buffSize), sizeof(buff_size));
++		std::memcpy(&cur_size, raw + offsetof(Gif_Path, curSize), sizeof(cur_size));
++		if (cur_size > buff_size)
++			return fail(fmt::format("GIF path {} buffer use {} exceeds capacity {}", path + 1, cur_size, buff_size));
++		t.Copy(path_size);
++		if (!t.Copy(cur_size))
++			return fail("truncated GIF path buffer");
++	}
++	t.Section("GIF unit + paths", s0, d0, "copied");
++
++	// gifDmaFreeze (Gif.cpp)
++	if (!t.Tag("GIFdma"))
++		return fail("missing GIFdma tag (GIF path layout mismatch)");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(sizeof(gif) + sizeof(gif_fifo)))
++		return fail("truncated GIF DMA state");
++	t.Section("GIF DMA", s0, d0, "copied");
++
++	// sprFreeze (SPR.cpp)
++	if (!t.Tag("SPRdma"))
++		return fail("missing SPRdma tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(SPR_FREEZE_SIZE))
++		return fail("truncated SPR DMA state");
++	t.Section("SPR DMA", s0, d0, "copied");
++
++	// mtvuFreeze (MTVU.cpp)
++	if (!t.Tag("MTVU"))
++		return fail("missing MTVU tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(4 * sizeof(unsigned int) + sizeof(u32) + sizeof(u64) + sizeof(u64) + sizeof(vu1Thread.vuCycleIdx)))
++		return fail("truncated MTVU state");
++	t.Section("MTVU", s0, d0, "copied");
++
++	// --- IOP subsystems ------------------------------------------------------------------
++	if (!t.Tag("IOP-Subsystems"))
++		return fail("missing IOP-Subsystems tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!t.Copy(sizeof(iopMem->Sif)))
++		return fail("truncated IOP SIF registers");
++	t.Section("IOP SIF registers", s0, d0, "copied");
++
++	// psxRcntFreeze (IopCounters.cpp)
++	if (!t.Tag("iopCounters"))
++		return fail("missing iopCounters tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	if (!widen)
++	{
++		if (!t.Copy(std::size(psxCounters) * sizeof(Legacy::psxCounter) + sizeof(s32) + sizeof(u32) + 2 * sizeof(bool)))
++			return fail("truncated IOP counters");
++		t.Section("IOP counters", s0, d0, "copied");
++	}
++	else
++	{
++	for (size_t i = 0; i < std::size(psxCounters); i++)
++	{
++		Legacy::psxCounter o;
++		if (!t.Read(o))
++			return fail("truncated IOP counter");
++		psxCounter n;
++		std::memset(&n, 0, sizeof(n));
++		n.count = o.count;
++		n.target = o.target;
++		n.rate = o.rate;
++		n.interrupt = o.interrupt;
++		n.startCycle = ctx.iop.Past(o.startCycle);
++		n.deltaCycles = o.deltaCycles;
++		n.mode = o.mode;
++		n.currentIrqMode = o.currentIrqMode;
++		t.Write(n);
++	}
++	{
++		s32 delta;
++		u32 start;
++		if (!t.Read(delta) || !t.Read(start))
++			return fail("truncated IOP counter schedule");
++		t.Write(delta);
++		t.Write(ctx.iop.Past(start));
++		if (!t.Copy(2 * sizeof(bool))) // hBlanking, vBlanking
++			return fail("truncated IOP blanking flags");
++	}
++	t.Section("IOP counters", s0, d0, "converted");
++	} // widen
++
++	// Sio0/Sio2/Multitap StateWrapper block (SaveState.cpp, SIO/*.cpp). Same encoding from
++	// 0x9A4F to this build (fields renamed only), except that 0x9A54 appended
++	// sioLastFrameMcdBusy to Sio2. Walked to find its length, then copied verbatim.
++	s0 = t.Pos(), d0 = t.OutPos();
++	{
++		WrapperWalker w(t.Peek(0), t.Remaining());
++		const bool sio0 = w.Marker("Sio0") &&
++						  w.Skip(sizeof(u32) * 3 + sizeof(u16) * 3) && // txData, rxData, stat, mode, ctrl, baud (private)
++						  w.Skip(SizeOf<decltype(Sio0::flag)>() + SizeOf<decltype(Sio0::sioStage)>() +
++								 SizeOf<decltype(Sio0::sioMode)>() + SizeOf<decltype(Sio0::sioCommand)>() +
++								 SizeOf<decltype(Sio0::padStarted)>() + SizeOf<decltype(Sio0::rxDataSet)>() +
++								 SizeOf<decltype(Sio0::port)>() + SizeOf<decltype(Sio0::slot)>());
++		const bool sio2 = sio0 && w.Marker("Sio2") &&
++						  w.Skip(SizeOf<decltype(Sio2::CmdQueue)>() + SizeOf<decltype(Sio2::PortCtrl0)>() +
++								 SizeOf<decltype(Sio2::PortCtrl1)>() + SizeOf<decltype(Sio2::dataIn)>() +
++								 SizeOf<decltype(Sio2::dataOut)>() + SizeOf<decltype(Sio2::ctrl)>() +
++								 SizeOf<decltype(Sio2::CmdStat)>() + SizeOf<decltype(Sio2::PortStat)>() +
++								 SizeOf<decltype(Sio2::FifoStat)>() + SizeOf<decltype(Sio2::FifoTxPos)>() +
++								 SizeOf<decltype(Sio2::FifoRxPos)>() + SizeOf<decltype(Sio2::iStat)>() +
++								 SizeOf<decltype(Sio2::port)>() + SizeOf<decltype(Sio2::queueRead)>() +
++								 SizeOf<decltype(Sio2::queuePosition)>() + SizeOf<decltype(Sio2::commandLength)>() +
++								 SizeOf<decltype(Sio2::processedLength)>() + SizeOf<decltype(Sio2::dmaBlockSize)>() +
++								 SizeOf<decltype(Sio2::queueComplete)>()) &&
++						  w.ByteDeque(64 * 1024) && w.ByteDeque(64 * 1024) &&
++						  w.Skip(sizeof(u64) * SIO::PORTS * SIO::SLOTS) && // memory card CRCs
++						  (pre_9a54 || w.Skip(sizeof(sioLastFrameMcdBusy)));
++		const size_t sio2_end = w.Pos();
++		const bool taps = sio2 && w.Marker("Multitap") && w.Skip(2) && w.Marker("Multitap") && w.Skip(2);
++		if (!taps)
++			return fail(sio0 ? (sio2 ? "invalid Multitap state" : "invalid Sio2 state") : "invalid Sio0 state");
++		if (!pre_9a54)
++		{
++			t.Copy(w.Pos());
++		}
++		else
++		{
++			// SIO.cpp: the frame of the last memory card access, used only for the "no memory card
++			// save in a long time" notice. The older formats do not record it; 0 is the value a
++			// freshly booted VM has.
++			t.Copy(sio2_end);
++			t.Write(static_cast<decltype(sioLastFrameMcdBusy)>(0));
++			t.Copy(w.Pos() - sio2_end);
++		}
++	}
++	t.Section("SIO0/SIO2/Multitap", s0, d0, pre_9a54 ? "copied (walked), field added" : "copied (walked)");
++	if (pre_9a54)
++		report.Add("    sioLastFrameMcdBusy (introduced in 0x9A54) set to 0");
++
++	// cdrFreeze, cdvdFreeze, deci2Freeze, InputRecordingFreeze
++	struct Record
++	{
++		const char* tag;
++		size_t size;
++	};
++	for (const Record& record : {Record{"cdrom", sizeof(cdr)}, Record{"cdvd", sizeof(cdvd)},
++			 Record{"deci2", DECI2_FREEZE_SIZE}, Record{"InputRecording", sizeof(g_FrameCount)}})
++	{
++		if (!t.Tag(record.tag))
++			return fail(fmt::format("missing {} tag", record.tag));
++		s0 = t.Pos(), d0 = t.OutPos();
++		if (!t.Copy(record.size))
++			return fail(fmt::format("truncated {} record", record.tag));
++		t.Section(record.tag, s0, d0, "copied");
++	}
++
++	// handleFreeze (IopBios.cpp). Absent in 0x9A4F; in 0x9A50 written only when the saving VM
++	// had HostFs enabled. From 0x9A54 the tag and a count are always present.
++	if (format == 0x9A4F || (format == 0x9A50 && t.Remaining() == 0))
++	{
++		d0 = t.OutPos();
++		char tag[32] = {};
++		StringUtil::Strlcpy(tag, "hostHandles", sizeof(tag));
++		t.Put(tag, sizeof(tag));
++		t.Write(static_cast<size_t>(0));
++		t.Section("host file handles", t.Pos(), d0, "added (none in source)");
++	}
++	else
++	{
++	if (!t.Tag("hostHandles"))
++		return fail("missing hostHandles tag");
++	s0 = t.Pos(), d0 = t.OutPos();
++	{
++		size_t count;
++		if (!t.Read(count) || count > 1024)
++			return fail("invalid host file handle count");
++		t.Write(count);
++		for (size_t i = 0; i < count; i++)
++		{
++			s32 pos, flags;
++			u32 length;
++			if (!t.Read(pos) || !t.Read(flags) || !t.Read(length) || length > 4096)
++				return fail("invalid host file handle");
++			t.Write(pos);
++			t.Write(flags);
++			t.Write(length);
++			if (!t.Copy(length) || !t.Copy(sizeof(u16)))
++				return fail("truncated host file handle");
++		}
++		if (count > 0)
++			report.Add("    {} host filesystem handle(s); restored only when HostFs is enabled", count);
++	}
++	t.Section("host file handles", s0, d0, "copied");
++	} // hostHandles present
++
++	if (t.Remaining() != 0)
++		return fail(fmt::format("{} unconsumed trailing bytes", t.Remaining()));
++
++	if (widen)
++		report.Add("  live timestamps predating a 32-bit counter wrap: EE {}, IOP {}", ctx.ee.wrapped, ctx.iop.wrapped);
++	report.Add("  complete: consumed {} of {} source bytes, produced {} target bytes", t.Pos(), src.size(), dst.size());
++	return true;
++}
++
++bool SaveStateLegacy::ConvertInternalStructures(std::span<const u8> src, std::vector<u8>& dst, Context& ctx, Report& report, Error* error)
++{
++	return TranslateInternals(src, dst, ctx, report, error, 0x9A54, true);
++}
++
++bool SaveStateLegacy::UpgradeInternalsTo9A54(std::span<const u8> src, std::vector<u8>& dst, u16 source_format, Report& report, Error* error)
++{
++	if (source_format != 0x9A4F && source_format != 0x9A50)
++	{
++		Error::SetStringFmt(error, "No 0x9A54 upgrade for format 0x{:04X}.", source_format);
++		return false;
++	}
++	Context unused;
++	return TranslateInternals(src, dst, unused, report, error, source_format, false);
++}
++
++// --------------------------------------------------------------------------------------
++//  SPU2
++// --------------------------------------------------------------------------------------
++namespace
++{
++	// pcsx2/SPU2/Mixer.cpp (identical in both formats)
++	static constexpr s32 s_xa_factor[16][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
++
++	// Decodes samples [first, 27] of the ADPCM block at word address `block`, continuing the
++	// predictor from the two preceding samples. Same arithmetic as XA_decode_block().
++	static void DecodeBlockTail(const s16* mem, u32 block, int first, s32 prev1, s32 prev2, s16 out[28])
++	{
++		const s32 header = mem[block];
++		const s32 shift = (header & 0xF) + 16;
++		const int id = (header >> 4) & 0xF;
++		const s32 pred1 = s_xa_factor[id][0];
++		const s32 pred2 = s_xa_factor[id][1];
++		for (int i = first; i < 28; i++)
++		{
++			const u16 word = static_cast<u16>(mem[block + 1 + i / 4]);
++			const s32 data = static_cast<s32>(static_cast<u32>((word >> ((i & 3) * 4)) & 0xF) << 28);
++			const s32 pcm = std::clamp<s32>((data >> shift) + (((pred1 * prev1) + (pred2 * prev2) + 32) >> 6), -0x8000, 0x7fff);
++			out[i] = static_cast<s16>(pcm);
++			prev2 = prev1;
++			prev1 = pcm;
++		}
++	}
++
++	struct SpuStats
++	{
++		int active = 0;
++		int exact = 0;
++		int unverified = 0;
++		int pending_loop_applied = 0;
++		int pending_loop_dropped = 0;
++	};
++
++	// The sample block held in the legacy voice's decode cache (SBuffer), if it can be
++	// determined without ambiguity. In the legacy mixer NextA is the next word to fetch and
++	// the block boundary is crossed when the first sample of the block's last word is fetched.
++	template <typename Voice>
++	static std::optional<u32> LegacyCurrentBlock(const Voice& v, std::optional<uptr> cache_base)
++	{
++		const int k = v.SCurrent - 1;
++		if (k < 24)
++		{
++			if ((v.NextA & 7) != static_cast<u32>(2 + k / 4))
++				return std::nullopt;
++			return v.NextA & 0xFFFF8;
++		}
++		if ((v.NextA & 7) != 1)
++			return std::nullopt;
++		if (!(v.LoopFlags & XAFLAG_LOOP_END))
++			return ((v.NextA & 0xFFFF8) - 8) & 0xFFFFF;
++		// Looped: the block address is no longer derivable from NextA. Recover it from the saved
++		// cache pointer, using the cache base established by the unambiguous voices.
++		if (!cache_base.has_value())
++			return std::nullopt;
++		const uptr ptr = reinterpret_cast<uptr>(v.SBuffer) - offsetof(PcmCacheEntry, Sampledata);
++		if (ptr < *cache_base || (ptr - *cache_base) % sizeof(PcmCacheEntry) != 0)
++			return std::nullopt;
++		const uptr index = (ptr - *cache_base) / sizeof(PcmCacheEntry);
++		if (index >= static_cast<uptr>(pcm_BlockCount))
++			return std::nullopt;
++		return static_cast<u32>(index * pcm_WordsPerBlock);
++	}
++
++	template <typename Voice>
++	static bool IsDecodingVoice(const Voice& v)
++	{
++		return v.ADSR.Phase > V_ADSR::PHASE_STOPPED && !v.Noise;
++	}
++
++	// Translates the legacy interpolation state (SCurrent, PV1..PV4, SP < 0) into the decode
++	// FIFO model (DecodeFifo, DecPosRead/DecPosWrite, SP >= 0) introduced at 10fc9a79.
++	//
++	// Legacy: the four most recently fetched samples PV4..PV1 are interpolated at
++	// (SP + 0x1000); NextA is the next ADPCM word to fetch; the current word has
++	// 3 - ((SCurrent - 1) & 3) samples not yet fetched.
++	// Target: interpolation reads DecodeFifo[DecPosRead + 0..3] at SP; decoding appends whole
++	// words at DecPosWrite and NextA is the next word to decode.
++	//
++	// The FIFO therefore holds PV4..PV1 followed by the unfetched remainder of the current
++	// word, and NextA carries over unchanged. Both mixers perform the IRQ-address check and
++	// the block-end/loop handling when a word is first read, so no reads are skipped or
++	// repeated. The remainder samples are decoded from the saved SPU2 RAM using PV1/PV2 as
++	// predictor history; the decode must reproduce the saved block-end history (Prev1/Prev2),
++	// otherwise those samples are left at zero (what a native load of the cache would give).
++	template <typename Voice>
++	static void ConvertVoice(const Voice& o, V_Voice& n, const s16* mem, std::optional<uptr> cache_base,
++		int core, int index, SpuStats& stats, Report& report)
++	{
++		std::memset(&n, 0, sizeof(n));
++		n.Volume = o.Volume;
++		n.ADSR = o.ADSR;
++		n.Pitch = o.Pitch;
++		n.LoopStartA = o.LoopStartA;
++		n.StartA = o.StartA;
++		n.NextA = o.NextA;
++		n.Prev1 = o.Prev1;
++		n.Prev2 = o.Prev2;
++		n.Modulated = o.Modulated;
++		n.Noise = o.Noise;
++		n.LoopMode = o.LoopMode;
++		n.LoopFlags = o.LoopFlags;
++		n.OutX = o.OutX;
++		n.SBuffer = nullptr; // recomputed by SPU2Savestate::ThawIt()
++
++		// 0x9A54 only: deferred LSA write (written within 4T of key-on). The legacy mixer applies
++		// it at its next fetch unless the waveform has set the loop point since key-on; later
++		// mixers apply LSA writes immediately. Resolve it with the legacy rule.
++		if constexpr (requires { o.PendingLoopStart; })
++		{
++			if (o.PendingLoopStart)
++			{
++				if (static_cast<s32>(o.LoopCycle - o.PlayCycle) < 0)
++				{
++					n.LoopStartA = o.PendingLoopStartA;
++					n.LoopMode = 1;
++					stats.pending_loop_applied++;
++				}
++				else
++				{
++					stats.pending_loop_dropped++;
++				}
++			}
++		}
++
++		const int k = o.SCurrent - 1;
++		const int remainder = 3 - (k & 3);
++		s32 fifo[32] = {};
++		fifo[0] = o.PV4;
++		fifo[1] = o.PV3;
++		fifo[2] = o.PV2;
++		fifo[3] = o.PV1;
++
++		if (IsDecodingVoice(o))
++		{
++			stats.active++;
++			// With the current word fully fetched there is nothing to reconstruct.
++			bool exact = (remainder == 0);
++			if (!exact)
++			{
++				if (const std::optional<u32> block = LegacyCurrentBlock(o, cache_base); block.has_value())
++				{
++					// k <= 26 here. Reproduce the rest of the block and require the saved
++					// block-end predictor history (s26, s27) to match.
++					s16 decoded[28] = {};
++					DecodeBlockTail(mem, *block, k + 1, o.PV1, o.PV2, decoded);
++					const s32 s26 = (k <= 25) ? decoded[26] : o.PV1;
++					exact = (decoded[27] == o.Prev1 && s26 == o.Prev2);
++					if (exact)
++					{
++						for (int i = 0; i < remainder; i++)
++							fifo[4 + i] = decoded[k + 1 + i];
++					}
++				}
++			}
++			if (exact)
++				stats.exact++;
++			else
++			{
++				stats.unverified++;
++				report.Add("    core {} voice {:2}: current ADPCM block not reproducible from SPU2 RAM; "
++						   "{} unfetched sample(s) of the current word left silent",
++					core, index, remainder);
++			}
++		}
++
++		std::memcpy(n.DecodeFifo, fifo, sizeof(fifo));
++		n.DecPosRead = 0;
++		n.DecPosWrite = 4 + remainder;
++		n.SP = (o.SP + 0x1000) & 0xFFF;
++	}
++} // namespace
++
++namespace
++{
++template <typename Block>
++static bool ConvertSPU2Block(std::span<const u8> src, std::vector<u8>& dst, const Context& ctx, u16 format, Report& report, Error* error)
++{
++	auto fail = [&](std::string_view what) {
++		const std::string message = fmt::format("Legacy 0x{:04X} SPU2: {}.", format, what);
++		report.Add(message);
++		Error::SetString(error, message);
++		return false;
++	};
++
++	report.Add("SPU2 ({} bytes, 0x{:04X} layout):", src.size(), format);
++	if (src.size() != sizeof(Block))
++		return fail(fmt::format("size {} does not match the 0x{:04X} layout ({})", src.size(), format, sizeof(Block)));
++	if (!ctx.cycles_known)
++		return fail("IOP clock reference unavailable");
++
++	auto o = std::make_unique<Block>();
++	std::memcpy(static_cast<void*>(o.get()), src.data(), sizeof(Block));
++	if (o->spu2id != SPU2_SAVE_ID || o->version != SPU2_SAVE_VERSION)
++		return fail(fmt::format("unexpected identifier {:08X}/version {:04X}", o->spu2id, o->version));
++
++	auto n = std::make_unique<Target::DataBlock>();
++	std::memset(static_cast<void*>(n.get()), 0, sizeof(Target::DataBlock));
++	n->spu2id = o->spu2id;
++	std::memcpy(n->unkregs, o->unkregs, sizeof(n->unkregs));
++	std::memcpy(n->mem, o->mem, sizeof(n->mem));
++	n->version = o->version;
++
++	const s16* mem = reinterpret_cast<const s16*>(o->mem);
++
++	// Establish the base address of the legacy process's pcm_cache_data from voices whose
++	// cached block is unambiguous; needed only for voices that looped inside their last word.
++	std::optional<uptr> cache_base;
++	bool base_conflict = false;
++	for (const auto& core : o->Cores)
++	{
++		for (const auto& v : core.Voices)
++		{
++			if (v.SCurrent < 1 || v.SCurrent > 28)
++				return fail(fmt::format("voice sample position {} outside 1..28", v.SCurrent));
++			// Freshly keyed-on voices (SCurrent == 28) still hold the previous sound's cache pointer.
++			if (!IsDecodingVoice(v) || !v.SBuffer || v.SCurrent == 28)
++				continue;
++			const std::optional<u32> block = LegacyCurrentBlock(v, std::nullopt);
++			if (!block.has_value())
++				continue;
++			const uptr base = reinterpret_cast<uptr>(v.SBuffer) - offsetof(PcmCacheEntry, Sampledata) -
++							  static_cast<uptr>(*block / pcm_WordsPerBlock) * sizeof(PcmCacheEntry);
++			if (cache_base.has_value() && *cache_base != base)
++				base_conflict = true;
++			cache_base = base;
++		}
++	}
++	if (base_conflict)
++		cache_base.reset();
++
++	SpuStats stats;
++	for (int c = 0; c < 2; c++)
++	{
++		const auto& oc = o->Cores[c];
++		V_Core& nc = n->Cores[c];
++
++		// Index .. FxVol: identical layout (static_assert above).
++		std::memcpy(static_cast<void*>(&nc), &oc, offsetof(V_Core, Voices));
++
++		for (int v = 0; v < V_Core::NumVoices; v++)
++		{
++			const auto& ov = oc.Voices[v];
++			if (ov.ADSR.Phase != V_ADSR::PHASE_STOPPED || ov.ADSR.Value != 0)
++			{
++				report.Add("    core {} voice {:2}: phase {} env {:5} pitch {:04X} noise {} SSA {:05X} NAX {:05X} LSA {:05X} "
++						   "flags {:X} SCurrent {:2} SP {:6} PV {:6} {:6} {:6} {:6} prev {:6} {:6}",
++					c, v, ov.ADSR.Phase, ov.ADSR.Value, ov.Pitch, ov.Noise ? 1 : 0, ov.StartA, ov.NextA, ov.LoopStartA,
++					static_cast<u8>(ov.LoopFlags), ov.SCurrent, ov.SP, ov.PV4, ov.PV3, ov.PV2, ov.PV1, ov.Prev2, ov.Prev1);
++			}
++			ConvertVoice(ov, nc.Voices[v], mem, cache_base, c, v, stats, report);
++		}
++
++		nc.IRQA = oc.IRQA;
++		nc.TSA = oc.TSA;
++		nc.ActiveTSA = oc.ActiveTSA;
++		nc.IRQEnable = oc.IRQEnable;
++		nc.FxEnable = oc.FxEnable;
++		nc.Mute = oc.Mute;
++		nc.AdmaInProgress = oc.AdmaInProgress;
++		nc.DMABits = oc.DMABits;
++		nc.NoiseClk = oc.NoiseClk;
++		nc.NoiseCnt = oc.NoiseCnt;
++		nc.NoiseOut = oc.NoiseOut;
++		nc.AutoDMACtrl = oc.AutoDMACtrl;
++		nc.DMAICounter = oc.DMAICounter;
++		nc.LastClock = ctx.iop.Near(oc.LastClock); // IOP clock (psxRegs.cycle) timestamp
++		nc.InputDataLeft = oc.InputDataLeft;
++		nc.InputDataTransferred = oc.InputDataTransferred;
++		nc.InputPosWrite = oc.InputPosWrite;
++		nc.InputDataProgress = oc.InputDataProgress;
++		nc.Revb = oc.Revb;
++		std::memcpy(nc.RevbDownBuf, oc.RevbDownBuf, sizeof(nc.RevbDownBuf));
++		std::memcpy(nc.RevbUpBuf, oc.RevbUpBuf, sizeof(nc.RevbUpBuf));
++		nc.RevbSampleBufPos = oc.RevbSampleBufPos;
++		nc.EffectsStartA = oc.EffectsStartA;
++		nc.EffectsEndA = oc.EffectsEndA;
++		nc.Regs = oc.Regs;
++		nc.LastEffect = oc.LastEffect;
++		nc.CoreEnabled = oc.CoreEnabled;
++		nc.AttrBit0 = oc.AttrBit0;
++		nc.DmaMode = oc.DmaMode;
++		nc.DmaStarted = oc.DmaStarted;
++		nc.AutoDmaFree = oc.AutoDmaFree;
++		nc.DMAPtr = oc.DMAPtr; // saved as offsets from IOP RAM (FIX_POINTER), unchanged encoding
++		nc.DMARPtr = oc.DMARPtr;
++		nc.ReadSize = oc.ReadSize;
++		nc.IsDMARead = oc.IsDMARead;
++		// KeyOn holds voices whose key-on is pending: in 0x9A54 those queued by a KON write
++		// (started after a 2T delay), from 0x9A55 the raw mask applied on the next tick, as in
++		// the target. 0x9A54 applies KOFF writes immediately, so nothing can be pending there.
++		nc.KeyOn = oc.KeyOn;
++		if constexpr (requires { oc.KeyOff; })
++			nc.KeyOff = oc.KeyOff;
++		else
++			nc.KeyOff = 0;
++		nc.psxSoundDataTransferControl = oc.psxSoundDataTransferControl;
++		nc.psxSPUSTAT = oc.psxSPUSTAT;
++
++		if (oc.KeyOn)
++			report.Add("    core {}: pending key-on mask {:06X} carried over", c, oc.KeyOn);
++	}
++
++	std::memcpy(static_cast<void*>(&n->Spdif), &o->Spdif, sizeof(V_SPDIF));
++	n->OutPos = o->OutPos;
++	n->InputPos = o->InputPos;
++	n->Cycles = o->Cycles;
++	n->lClocks = ctx.iop.Near(o->lClocks);
++	n->PlayMode = o->PlayMode;
++
++	report.Add("  voices: {} decoding, {} with exact decode continuation, {} with silent remainder",
++		stats.active, stats.exact, stats.unverified);
++	if (stats.pending_loop_applied || stats.pending_loop_dropped)
++		report.Add("  deferred loop-start writes: {} applied, {} superseded by waveform loop flags",
++			stats.pending_loop_applied, stats.pending_loop_dropped);
++	report.Add("  ADPCM cache base {}", cache_base.has_value() ? "recovered" : "not needed or unavailable");
++	report.Add("  complete: {} -> {} bytes", src.size(), sizeof(Target::DataBlock));
++
++	const u8* bytes = reinterpret_cast<const u8*>(n.get());
++	dst.assign(bytes, bytes + sizeof(Target::DataBlock));
++	return true;
++}
++} // namespace
++
++size_t SaveStateLegacy::TargetSPU2Size()
++{
++	return sizeof(Target::DataBlock);
++}
++
++namespace
++{
++// GSState::Freeze (GS/GSState.cpp). Version 8 (0x9A4F/0x9A50): version, 15 GIFRegs (PRIM ..
++// TRXREG and an obsolete second TRXREG), 2 contexts x 12 GIFRegs, RGBAQ, ST (8 each), UV, FOG
++// (4 each), XYZ (8), an obsolete GIFReg, m_tr.x, m_tr.y, local memory (4 MiB), 4 x (GIFTag,
++// u32 reg), m_q. Version 9 (0x9A54 to this build) inserts the transfer state after m_tr.y.
++static constexpr size_t GS_OFS_BITBLTBUF = 4 + 10 * 8;
++static constexpr size_t GS_OFS_TRXPOS = 4 + 12 * 8;
++static constexpr size_t GS_OFS_TRXREG_KEPT = 4 + 14 * 8; // Defrost reads TRXREG twice; the second copy stays
++static constexpr size_t GS_OFS_TRANSFER = 4 + 15 * 8 + 2 * 12 * 8 + 32 + 8 + 2 * 4;
++static constexpr size_t GS_LOCAL_MEMORY_SIZE = 4 * 1024 * 1024;
++static constexpr size_t GS_STATE_V8_SIZE = GS_OFS_TRANSFER + GS_LOCAL_MEMORY_SIZE + 4 * (16 + 4) + 4;
++
++#pragma pack(push, 1)
++struct GSTransferV9 // m_tr.w, h, m_blit, m_pos, m_reg, rect, total, start, end, write
++{
++	s32 w, h;
++	u64 blit, pos, reg;
++	s32 rect[4];
++	s32 total, start, end;
++	u8 write;
++};
++#pragma pack(pop)
++static_assert(sizeof(GSTransferV9) == 61);
++static constexpr size_t GS_STATE_V9_SIZE = GS_STATE_V8_SIZE + sizeof(GSTransferV9);
++static_assert(GS_OFS_TRANSFER == 364 && GS_STATE_V8_SIZE == 4194752 && GS_STATE_V9_SIZE == 4194813);
++
++// The target's component loader reads exactly GetSaveStateSize(9) bytes from GS.bin, so version 8
++// data cannot be passed through although GSState::Defrost understands it. The inserted transfer
++// state is the one Defrost derives for version 8 data ("assume the last transfer was a write (but
++// nuke it)"), so the loaded GS state is identical to a native version 8 load.
++static void UpgradeGSState8To9(std::vector<u8>& gs)
++{
++	u64 blit, pos, reg;
++	std::memcpy(&blit, gs.data() + GS_OFS_BITBLTBUF, sizeof(blit));
++	std::memcpy(&pos, gs.data() + GS_OFS_TRXPOS, sizeof(pos));
++	std::memcpy(&reg, gs.data() + GS_OFS_TRXREG_KEPT, sizeof(reg));
++
++	GSTransferV9 tr = {};
++	tr.w = static_cast<s32>(reg & 0xFFF); // TRXREG.RRW
++	tr.h = static_cast<s32>((reg >> 32) & 0xFFF); // TRXREG.RRH
++	tr.blit = blit;
++	tr.pos = pos;
++	tr.reg = reg;
++	const s32 dsax = static_cast<s32>((pos >> 32) & 0x7FF); // TRXPOS.DSAX
++	const s32 dsay = static_cast<s32>((pos >> 48) & 0x7FF); // TRXPOS.DSAY
++	tr.rect[0] = dsax;
++	tr.rect[1] = dsay;
++	tr.rect[2] = dsax + tr.w;
++	tr.rect[3] = dsay + tr.h;
++	tr.write = 1;
++
++	const u32 version = 9;
++	std::memcpy(gs.data(), &version, sizeof(version));
++	const u8* bytes = reinterpret_cast<const u8*>(&tr);
++	gs.insert(gs.begin() + GS_OFS_TRANSFER, bytes, bytes + sizeof(tr));
++}
++
++// 0x9A54 -> 0x9A55 (PCSX2 2.6.x). Both use the fetch/interpolation mixer, so voices keep their
++// playback state; 0x9A55 drops the deferred loop-start fields (resolved with the legacy rule)
++// and adds a pending KeyOff mask. Clocks stay 32-bit.
++static bool ConvertSPU2To9A55(std::span<const u8> src, std::vector<u8>& dst, Report& report, Error* error)
++{
++	auto fail = [&](std::string_view what) {
++		const std::string message = fmt::format("Legacy 0x9A54 SPU2 -> 0x9A55: {}.", what);
++		report.Add(message);
++		Error::SetString(error, message);
++		return false;
++	};
++
++	report.Add("SPU2 ({} bytes, 0x9A54 layout) -> 0x9A55 layout:", src.size());
++	if (src.size() != sizeof(Legacy::DataBlock9A54))
++		return fail(fmt::format("size {} does not match the 0x9A54 layout", src.size()));
++
++	auto o = std::make_unique<Legacy::DataBlock9A54>();
++	std::memcpy(static_cast<void*>(o.get()), src.data(), sizeof(Legacy::DataBlock9A54));
++	if (o->spu2id != SPU2_SAVE_ID || o->version != SPU2_SAVE_VERSION)
++		return fail(fmt::format("unexpected identifier {:08X}/version {:04X}", o->spu2id, o->version));
++
++	auto n = std::make_unique<Legacy::DataBlock9A55>();
++	std::memset(static_cast<void*>(n.get()), 0, sizeof(Legacy::DataBlock9A55));
++	n->spu2id = o->spu2id;
++	std::memcpy(n->unkregs, o->unkregs, sizeof(n->unkregs));
++	std::memcpy(n->mem, o->mem, sizeof(n->mem));
++	n->version = o->version;
++
++	int applied = 0, dropped = 0;
++	for (int c = 0; c < 2; c++)
++	{
++		const Legacy::V_Core9A54& oc = o->Cores[c];
++		Legacy::V_Core9A55& nc = n->Cores[c];
++		std::memcpy(static_cast<void*>(&nc), &oc, offsetof(Legacy::V_Core9A55, Voices));
++
++		for (int i = 0; i < V_Core::NumVoices; i++)
++		{
++			const Legacy::V_Voice9A54& ov = oc.Voices[i];
++			Legacy::V_Voice9A55& nv = nc.Voices[i];
++			nv.Volume = ov.Volume;
++			nv.ADSR = ov.ADSR;
++			nv.Pitch = ov.Pitch;
++			nv.LoopStartA = ov.LoopStartA;
++			nv.StartA = ov.StartA;
++			nv.NextA = ov.NextA;
++			nv.Prev1 = ov.Prev1;
++			nv.Prev2 = ov.Prev2;
++			nv.Modulated = ov.Modulated;
++			nv.Noise = ov.Noise;
++			nv.LoopMode = ov.LoopMode;
++			nv.LoopFlags = ov.LoopFlags;
++			nv.SP = ov.SP;
++			nv.SPc = ov.SPc;
++			nv.PV4 = ov.PV4;
++			nv.PV3 = ov.PV3;
++			nv.PV2 = ov.PV2;
++			nv.PV1 = ov.PV1;
++			nv.OutX = ov.OutX;
++			nv.NextCrest = ov.NextCrest;
++			nv.SBuffer = nullptr; // recomputed from NextA by ThawIt()
++			nv.SCurrent = ov.SCurrent;
++			if (ov.PendingLoopStart)
++			{
++				if (static_cast<s32>(ov.LoopCycle - ov.PlayCycle) < 0)
++				{
++					nv.LoopStartA = ov.PendingLoopStartA;
++					nv.LoopMode = 1;
++					applied++;
++				}
++				else
++				{
++					dropped++;
++				}
++			}
++		}
++
++		nc.IRQA = oc.IRQA;
++		nc.TSA = oc.TSA;
++		nc.ActiveTSA = oc.ActiveTSA;
++		nc.IRQEnable = oc.IRQEnable;
++		nc.FxEnable = oc.FxEnable;
++		nc.Mute = oc.Mute;
++		nc.AdmaInProgress = oc.AdmaInProgress;
++		nc.DMABits = oc.DMABits;
++		nc.NoiseClk = oc.NoiseClk;
++		nc.NoiseCnt = oc.NoiseCnt;
++		nc.NoiseOut = oc.NoiseOut;
++		nc.AutoDMACtrl = oc.AutoDMACtrl;
++		nc.DMAICounter = oc.DMAICounter;
++		nc.LastClock = oc.LastClock;
++		nc.InputDataLeft = oc.InputDataLeft;
++		nc.InputDataTransferred = oc.InputDataTransferred;
++		nc.InputPosWrite = oc.InputPosWrite;
++		nc.InputDataProgress = oc.InputDataProgress;
++		nc.Revb = oc.Revb;
++		std::memcpy(nc.RevbDownBuf, oc.RevbDownBuf, sizeof(nc.RevbDownBuf));
++		std::memcpy(nc.RevbUpBuf, oc.RevbUpBuf, sizeof(nc.RevbUpBuf));
++		nc.RevbSampleBufPos = oc.RevbSampleBufPos;
++		nc.EffectsStartA = oc.EffectsStartA;
++		nc.EffectsEndA = oc.EffectsEndA;
++		nc.Regs = oc.Regs;
++		nc.LastEffect = oc.LastEffect;
++		nc.CoreEnabled = oc.CoreEnabled;
++		nc.AttrBit0 = oc.AttrBit0;
++		nc.DmaMode = oc.DmaMode;
++		nc.DmaStarted = oc.DmaStarted;
++		nc.AutoDmaFree = oc.AutoDmaFree;
++		nc.DMAPtr = oc.DMAPtr;
++		nc.DMARPtr = oc.DMARPtr;
++		nc.ReadSize = oc.ReadSize;
++		nc.IsDMARead = oc.IsDMARead;
++		nc.KeyOn = oc.KeyOn; // queued key-ons start on the next tick (see ConvertSPU2Block)
++		nc.KeyOff = 0;
++		nc.psxSoundDataTransferControl = oc.psxSoundDataTransferControl;
++		nc.psxSPUSTAT = oc.psxSPUSTAT;
++	}
++
++	std::memcpy(static_cast<void*>(&n->Spdif), &o->Spdif, sizeof(V_SPDIF));
++	n->OutPos = o->OutPos;
++	n->InputPos = o->InputPos;
++	n->Cycles = o->Cycles;
++	n->lClocks = o->lClocks;
++	n->PlayMode = o->PlayMode;
++
++	if (applied || dropped)
++		report.Add("  deferred loop-start writes: {} applied, {} superseded by waveform loop flags", applied, dropped);
++	report.Add("  complete: {} -> {} bytes (voice playback state carried over)", src.size(), sizeof(Legacy::DataBlock9A55));
++	const u8* bytes = reinterpret_cast<const u8*>(n.get());
++	dst.assign(bytes, bytes + sizeof(Legacy::DataBlock9A55));
++	return true;
++}
++} // namespace
++
++bool SaveStateLegacy::ConvertSPU2(std::span<const u8> src, std::vector<u8>& dst, const Context& ctx, u16 source_format, Report& report, Error* error)
++{
++	switch (source_format)
++	{
++		case 0x9A54:
++			return ConvertSPU2Block<Legacy::DataBlock9A54>(src, dst, ctx, source_format, report, error);
++		case 0x9A55:
++			return ConvertSPU2Block<Legacy::DataBlock9A55>(src, dst, ctx, source_format, report, error);
++		default:
++			Error::SetStringFmt(error, "No SPU2 schema for format 0x{:04X}.", source_format);
++			return false;
++	}
++}
++
++// --------------------------------------------------------------------------------------
++//  Archive level
++// --------------------------------------------------------------------------------------
++namespace
++{
++	static constexpr const char* ENTRY_VERSION = "PCSX2 Savestate Version.id";
++	static constexpr const char* ENTRY_SCREENSHOT = "Screenshot.png";
++	static constexpr const char* ENTRY_INTERNALS = "PCSX2 Internal Structures.dat";
++
++	enum class Kind
++	{
++		Memory,
++		SPU2,
++		Wrapper,
++		GS,
++		Optional,
++	};
++
++	struct KnownEntry
++	{
++		const char* name;
++		Kind kind;
++		bool required;
++		u32 size_a; // accepted sizes for raw memory images
++		u32 size_b;
++		const char* marker; // first StateWrapper marker
++	};
++
++	// Same order as SavestateEntries[] in SaveState.cpp.
++	static const KnownEntry s_entries[] = {
++		{"eeMemory.bin", Kind::Memory, true, Ps2MemSize::MainRam, Ps2MemSize::TotalRam, nullptr},
++		{"iopMemory.bin", Kind::Memory, true, Ps2MemSize::IopRam, Ps2MemSize::TotalIopRam, nullptr},
++		{"eeHwRegs.bin", Kind::Memory, true, Ps2MemSize::Hardware, Ps2MemSize::Hardware, nullptr},
++		{"iopHwRegs.bin", Kind::Memory, true, Ps2MemSize::IopHardware, Ps2MemSize::IopHardware, nullptr},
++		{"Scratchpad.bin", Kind::Memory, true, Ps2MemSize::Scratch, Ps2MemSize::Scratch, nullptr},
++		{"vu0Memory.bin", Kind::Memory, true, VU0_MEMSIZE, VU0_MEMSIZE, nullptr},
++		{"vu1Memory.bin", Kind::Memory, true, VU1_MEMSIZE, VU1_MEMSIZE, nullptr},
++		{"vu0MicroMem.bin", Kind::Memory, true, VU0_PROGSIZE, VU0_PROGSIZE, nullptr},
++		{"vu1MicroMem.bin", Kind::Memory, true, VU1_PROGSIZE, VU1_PROGSIZE, nullptr},
++		{"SPU2.bin", Kind::SPU2, true, 0, 0, nullptr},
++		{"USB.bin", Kind::Wrapper, false, 0, 0, "USB"},
++		{"PAD.bin", Kind::Wrapper, true, 0, 0, "PAD"},
++		{"GS.bin", Kind::GS, true, 0, 0, nullptr},
++		{"Achievements.bin", Kind::Optional, false, 0, 0, nullptr},
++	};
++
++	static std::optional<std::vector<u8>> ReadEntry(zip_t* zf, const char* name)
++	{
++		const zip_int64_t index = zip_name_locate(zf, name, 0);
++		if (index < 0)
++			return std::nullopt;
++		zip_stat_t zst;
++		if (zip_stat_index(zf, index, 0, &zst) != 0 || !(zst.valid & ZIP_STAT_SIZE) || zst.size > 256 * _1mb)
++			return std::nullopt;
++		auto file = zip_fopen_index_managed(zf, index, 0);
++		if (!file)
++			return std::nullopt;
++		std::vector<u8> data(static_cast<size_t>(zst.size));
++		if (zip_fread(file.get(), data.data(), data.size()) != static_cast<zip_int64_t>(data.size()))
++			return std::nullopt;
++		return data;
++	}
++
++	static bool StartsWithMarker(const std::vector<u8>& data, const char* marker)
++	{
++		const u32 length = static_cast<u32>(std::strlen(marker));
++		u32 stored;
++		if (data.size() < sizeof(u32) + length)
++			return false;
++		std::memcpy(&stored, data.data(), sizeof(stored));
++		return stored == length && std::memcmp(data.data() + sizeof(u32), marker, length) == 0;
++	}
++
++	// Version indicator: g_SaveVersion followed by a 32-byte build description.
++	struct VersionRecord
++	{
++		u32 version;
++		char build[32];
++	};
++	static_assert(sizeof(VersionRecord) == 36);
++
++	static VersionRecord MakeVersionRecord(const ConvertedState& state)
++	{
++		VersionRecord record = {};
++		record.version = static_cast<u32>(state.target_format) << 16;
++		StringUtil::Strlcpy(record.build, fmt::format("{} (converted)", state.source_build).c_str(), sizeof(record.build));
++		return record;
++	}
++
++	// zip_source_buffer() does not copy: every buffer, including `version`, must stay alive
++	// until the archive has been closed.
++	static bool AddEntries(zip_t* zf, const ConvertedState& state, const VersionRecord& version, bool compress, Error* error)
++	{
++		auto add = [&](const char* name, const void* data, size_t size, bool store) {
++			zip_source_t* zs = zip_source_buffer(zf, data, size, 0);
++			if (!zs)
++				return false;
++			const zip_int64_t index = zip_file_add(zf, name, zs, ZIP_FL_ENC_UTF_8 | ZIP_FL_OVERWRITE);
++			if (index < 0)
++			{
++				zip_source_free(zs);
++				return false;
++			}
++			if (store || !compress)
++				zip_set_file_compression(zf, index, ZIP_CM_STORE, 0);
++			else
++				zip_set_file_compression(zf, index, ZIP_CM_ZSTD, 0);
++			return true;
++		};
++
++		bool ok = add(ENTRY_VERSION, &version, sizeof(VersionRecord), true);
++		if (ok && !state.screenshot_png.empty())
++			ok = add(ENTRY_SCREENSHOT, state.screenshot_png.data(), state.screenshot_png.size(), true);
++		for (const Entry& entry : state.entries)
++			ok = ok && add(entry.name.c_str(), entry.data.data(), entry.data.size(), false);
++
++		if (!ok)
++			Error::SetStringFmt(error, "Failed to add converted entries to archive: {}", zip_strerror(zf));
++		return ok;
++	}
++} // namespace
++
++bool SaveStateLegacy::ConvertArchive(zip_t* zf, ConvertedState* out, Error* error)
++{
++	ConvertedState& state = *out;
++	Report& report = state.report;
++
++	std::optional<std::vector<u8>> version = ReadEntry(zf, ENTRY_VERSION);
++	if (!version.has_value() || version->size() < sizeof(u32))
++	{
++		Error::SetString(error, "Savestate file does not contain version indicator.");
++		return false;
++	}
++	std::memcpy(&state.source_version, version->data(), sizeof(u32));
++	if (version->size() >= sizeof(u32) + 32)
++	{
++		char build[33] = {};
++		std::memcpy(build, version->data() + sizeof(u32), 32);
++		state.source_build = build;
++	}
++	if (!IsLegacyVersion(state.source_version))
++	{
++		Error::SetStringFmt(error, "Format 0x{:04X} has no translation (supported: 0x9A4F, 0x9A50, 0x9A54, 0x9A55).", state.source_version >> 16);
++		return false;
++	}
++	// The Internal Structures stream is identical for 0x9A54 and 0x9A55 (v2.4.0, v2.5.258 and
++	// v2.6.3 freeze the same fields in the same order); only SPU2.bin differs.
++	state.source_format = static_cast<u16>(state.source_version >> 16);
++	const u16 native_format = static_cast<u16>(g_SaveVersion >> 16);
++	if (state.target_format == 0)
++		state.target_format = native_format;
++	const u16 source = state.source_format;
++	const u16 target = state.target_format;
++	const bool pre_9a54 = source == 0x9A4F || source == 0x9A50;
++	const bool supported = (target == native_format) ||
++						   (target == TargetFormat9A55 && source != 0x9A55) ||
++						   (target == TargetFormat9A54 && pre_9a54) ||
++						   (target == TargetFormat9A50 && source == 0x9A4F);
++	if (!supported)
++	{
++		Error::SetStringFmt(error, "No translation from 0x{:04X} to 0x{:04X}.", source, target);
++		return false;
++	}
++	report.Add("Legacy save state: format 0x{:04X}.{:04X}, build '{}' -> target format 0x{:04X}.0000",
++		state.source_version >> 16, state.source_version & 0xFFFF, state.source_build, target);
++
++	// Internal structures first: they provide the clock references for SPU2. Older streams are
++	// first brought to the 0x9A54 layout; the full 0x9A54 parse then validates every target.
++	std::optional<std::vector<u8>> internals = ReadEntry(zf, ENTRY_INTERNALS);
++	if (!internals.has_value())
++	{
++		Error::SetString(error, "Legacy state has no readable internal structures entry.");
++		return false;
++	}
++	std::vector<u8> layout54;
++	if (pre_9a54)
++	{
++		if (!UpgradeInternalsTo9A54(*internals, layout54, source, report, error))
++			return false;
++	}
++	else
++	{
++		layout54 = *internals;
++	}
++	std::vector<u8> converted;
++	if (!ConvertInternalStructures(layout54, converted, state.context, report, error))
++		return false;
++	if (target == TargetFormat9A55 || target == TargetFormat9A54)
++	{
++		report.Add("  0x{:04X} target: 0x9A54 stream layout kept", target);
++		converted = std::move(layout54);
++	}
++	else if (target == TargetFormat9A50)
++	{
++		// 0x9A4F -> 0x9A50 only added the host file handle section (empty here).
++		report.Add("  0x9A50 target: source stream kept, empty host file handle section appended");
++		converted = std::move(*internals);
++		char tag[32] = {};
++		StringUtil::Strlcpy(tag, "hostHandles", sizeof(tag));
++		const size_t none = 0;
++		converted.insert(converted.end(), reinterpret_cast<const u8*>(tag), reinterpret_cast<const u8*>(tag) + sizeof(tag));
++		converted.insert(converted.end(), reinterpret_cast<const u8*>(&none), reinterpret_cast<const u8*>(&none) + sizeof(none));
++	}
++	state.entries.push_back({ENTRY_INTERNALS, std::move(converted)});
++
++	for (const KnownEntry& known : s_entries)
++	{
++		std::optional<std::vector<u8>> data = ReadEntry(zf, known.name);
++		if (!data.has_value())
++		{
++			if (known.required)
++			{
++				Error::SetStringFmt(error, "Legacy state is missing required component {}.", known.name);
++				report.Add("{}: MISSING", known.name);
++				return false;
++			}
++			report.Add("{}: absent (optional)", known.name);
++			continue;
++		}
++
++		switch (known.kind)
++		{
++			case Kind::Memory:
++				if (data->size() != known.size_a && data->size() != known.size_b)
++				{
++					Error::SetStringFmt(error, "{} has unexpected size {}.", known.name, data->size());
++					return false;
++				}
++				report.Add("{}: {} bytes, raw memory image, copied", known.name, data->size());
++				break;
++
++			case Kind::SPU2:
++			{
++				// 0x9A4F and 0x9A50 use the 0x9A54 SPU2 block (same defs.h layout and SAVE_VERSION).
++				const u16 spu2_layout = pre_9a54 ? static_cast<u16>(0x9A54) : source;
++				std::vector<u8> spu2;
++				bool ok;
++				if (target == native_format)
++					ok = ConvertSPU2(*data, spu2, state.context, spu2_layout, report, error);
++				else if (target == TargetFormat9A55)
++					ok = ConvertSPU2To9A55(*data, spu2, report, error);
++				else
++				{
++					// 0x9A54/0x9A50 targets keep the block; check it is the expected layout.
++					std::vector<u8> scratch;
++					Report quiet;
++					quiet.echo_to_console = false;
++					ok = ConvertSPU2(*data, scratch, state.context, spu2_layout, quiet, error);
++					spu2 = *data;
++					if (ok)
++						report.Add("SPU2 ({} bytes): 0x9A54 layout, unchanged in the target format, copied", data->size());
++				}
++				if (!ok)
++					return false;
++				data = std::move(spu2);
++				break;
++			}
++
++			case Kind::Wrapper:
++				// Pad::Freeze / USB::DoState encodings are unchanged between v2.5.258 and v2.8.2.
++				if (!StartsWithMarker(*data, known.marker))
++				{
++					Error::SetStringFmt(error, "{} does not start with the '{}' marker.", known.name, known.marker);
++					return false;
++				}
++				report.Add("{}: {} bytes, '{}' StateWrapper stream, format unchanged, copied", known.name, data->size(),
++					known.marker);
++				break;
++
++			case Kind::GS:
++			{
++				// GSState::Freeze: STATE_VERSION 8 in 0x9A4F/0x9A50, 9 (identical layout) from 0x9A54
++				// to this build.
++				u32 gs_version = 0;
++				if (data->size() >= sizeof(u32))
++					std::memcpy(&gs_version, data->data(), sizeof(u32));
++				const u32 target_gs_version = (target == TargetFormat9A50) ? 8 : 9;
++				const size_t expected = (gs_version == 8) ? GS_STATE_V8_SIZE : GS_STATE_V9_SIZE;
++				if ((gs_version != 8 && gs_version != 9) || gs_version > target_gs_version || data->size() != expected)
++				{
++					Error::SetStringFmt(error, "GS.bin has unsupported renderer state version {} ({} bytes).", gs_version, data->size());
++					return false;
++				}
++				if (gs_version == target_gs_version)
++				{
++					report.Add("{}: {} bytes, GS state version {}, unchanged in the target format, copied", known.name, data->size(), gs_version);
++					break;
++				}
++				UpgradeGSState8To9(*data);
++				report.Add("{}: GS state version 8 -> 9 ({} -> {} bytes), transfer state set as GSState::Defrost derives it for version 8",
++					known.name, GS_STATE_V8_SIZE, data->size());
++				break;
++			}
++
++			case Kind::Optional:
++				report.Add("{}: {} bytes, copied", known.name, data->size());
++				break;
++		}
++
++		state.entries.push_back({known.name, std::move(*data)});
++	}
++
++	if (std::optional<std::vector<u8>> png = ReadEntry(zf, ENTRY_SCREENSHOT); png.has_value())
++		state.screenshot_png = std::move(*png);
++
++	// Report entries the native loader would not read.
++	const zip_int64_t count = zip_get_num_entries(zf, 0);
++	for (zip_int64_t i = 0; i < count; i++)
++	{
++		const char* name = zip_get_name(zf, static_cast<zip_uint64_t>(i), 0);
++		if (!name)
++			continue;
++		const bool known = std::strcmp(name, ENTRY_VERSION) == 0 || std::strcmp(name, ENTRY_SCREENSHOT) == 0 ||
++						   std::strcmp(name, ENTRY_INTERNALS) == 0 ||
++						   std::any_of(std::begin(s_entries), std::end(s_entries),
++							   [name](const KnownEntry& e) { return std::strcmp(e.name, name) == 0; });
++		if (!known)
++			report.Add("{}: not part of the target format, dropped", name);
++	}
++
++	report.Add("Conversion complete: all required components translated.");
++	return true;
++}
++
++bool SaveStateLegacy::WriteArchive(const ConvertedState& state, const char* output, Error* error)
++{
++	// FileSystem uses long (\\?\) paths on Windows, which do not accept '/' separators.
++	const std::string native = Path::Canonicalize(Path::ToNativePath(output));
++	const char* filename = native.c_str();
++	if (FileSystem::FileExists(filename))
++	{
++		Error::SetStringFmt(error, "Refusing to overwrite existing file '{}'.", native);
++		return false;
++	}
++
++	const std::string temp = fmt::format("{}.partial", native);
++	if (FileSystem::FileExists(temp.c_str()) && !FileSystem::DeleteFilePath(temp.c_str(), error))
++		return false;
++	zip_error_t ze = {};
++	zip_source_t* zs = zip_source_file_create(temp.c_str(), 0, 0, &ze);
++	zip_t* zf = zs ? zip_open_from_source(zs, ZIP_CREATE | ZIP_TRUNCATE, &ze) : nullptr;
++	if (!zf)
++	{
++		if (zs)
++			zip_source_free(zs);
++		Error::SetStringFmt(error, "Failed to create '{}': {}", temp, zip_error_strerror(&ze));
++		return false;
++	}
++
++	const VersionRecord version = MakeVersionRecord(state);
++	if (!AddEntries(zf, state, version, true, error))
++	{
++		zip_discard(zf);
++		FileSystem::DeleteFilePath(temp.c_str());
++		return false;
++	}
++	if (zip_close(zf) != 0)
++	{
++		Error::SetStringFmt(error, "Failed to write '{}': {}", temp, zip_strerror(zf));
++		zip_discard(zf);
++		FileSystem::DeleteFilePath(temp.c_str());
++		return false;
++	}
++	if (!FileSystem::RenamePath(temp.c_str(), filename, error))
++	{
++		FileSystem::DeleteFilePath(temp.c_str());
++		return false;
++	}
++	return true;
++}
++
++std::unique_ptr<zip_t, void (*)(zip_t*)> SaveStateLegacy::OpenAsNativeArchive(const ConvertedState& state, Error* error)
++{
++	auto discard = [](zip_t* zf) {
++		if (zf)
++			zip_discard(zf);
++	};
++	std::unique_ptr<zip_t, void (*)(zip_t*)> result(nullptr, discard);
++
++	zip_error_t ze = {};
++	zip_source_t* zs = zip_source_buffer_create(nullptr, 0, 0, &ze);
++	if (!zs)
++	{
++		Error::SetStringFmt(error, "Failed to create in-memory archive: {}", zip_error_strerror(&ze));
++		return result;
++	}
++	zip_source_keep(zs);
++
++	zip_t* writer = zip_open_from_source(zs, ZIP_TRUNCATE, &ze);
++	if (!writer)
++	{
++		zip_source_free(zs);
++		zip_source_free(zs);
++		Error::SetStringFmt(error, "Failed to open in-memory archive: {}", zip_error_strerror(&ze));
++		return result;
++	}
++	const VersionRecord version = MakeVersionRecord(state);
++	if (!AddEntries(writer, state, version, false, error) || zip_close(writer) != 0)
++	{
++		if (!error || !error->IsValid())
++			Error::SetStringFmt(error, "Failed to build in-memory archive: {}", zip_strerror(writer));
++		zip_discard(writer);
++		zip_source_free(zs);
++		return result;
++	}
++
++	zip_t* reader = zip_open_from_source(zs, ZIP_RDONLY, &ze);
++	if (!reader)
++	{
++		zip_source_free(zs);
++		Error::SetStringFmt(error, "Failed to reopen in-memory archive: {}", zip_error_strerror(&ze));
++		return result;
++	}
++	result.reset(reader);
++	return result;
++}
+diff --git a/pcsx2/SaveStateLegacy.h b/pcsx2/SaveStateLegacy.h
+new file mode 100644
+index 000000000..b1169f593
+--- /dev/null
++++ b/pcsx2/SaveStateLegacy.h
+@@ -0,0 +1,145 @@
++// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
++// SPDX-License-Identifier: GPL-3.0+
++
++// Experimental reader for save-state formats 0x9A4F (PCSX2 v2.0.x), 0x9A50 (v2.2.0), 0x9A54
++// (v2.4.0 and the v2.5.x development builds that preceded the 0x9A55 bump) and 0x9A55 (v2.6.x).
++// Every archive entry is translated into the native representation of this build (or of an
++// older stable target format) before any emulator state is touched. The translation is purely
++// data-to-data: nothing in this module reads or writes VM state, and it does not depend on
++// emulator code beyond type definitions.
++
++#pragma once
++
++#include "common/Pcsx2Defs.h"
++
++#include "fmt/format.h"
++
++#include <memory>
++#include <span>
++#include <string>
++#include <vector>
++
++class Error;
++typedef struct zip zip_t;
++
++namespace SaveStateLegacy
++{
++	// Source formats with a translation to this build's format: 0x9A4F (PCSX2 2.0.x),
++	// 0x9A50 (2.2.0), 0x9A54 (2.4.0 and the 2.5.x development builds), 0x9A55 (2.6.x).
++	static constexpr u16 SourceFormats[] = {0x9A4F, 0x9A50, 0x9A54, 0x9A55};
++
++	struct Report
++	{
++		std::vector<std::string> lines;
++		bool echo_to_console = true;
++
++		void Add(std::string line);
++
++		template <typename... T>
++		void Add(fmt::format_string<T...> format, T&&... args)
++		{
++			Add(fmt::format(format, std::forward<T>(args)...));
++		}
++	};
++
++	// Maps a 32-bit cycle counter domain onto the 64-bit counters used since 0x9A58.
++	// The legacy counters wrap every 2^32 cycles (about 14.6 s of EE time and 116 s of
++	// IOP time), so zero-extension would turn timestamps captured before a wrap into
++	// far-future values. Instead, the reference counter is placed at 2^32 + now and
++	// every other timestamp keeps its modular distance from the reference. The low 32 bits
++	// of every value, and every difference between values, are preserved exactly.
++	struct CycleDomain
++	{
++		static constexpr u64 Epoch = u64{1} << 32;
++
++		u32 now32 = 0;
++		u64 now64 = 0;
++		// Number of live Past() timestamps that predate a 32-bit wrap of the reference counter.
++		// Zero-extension would have placed each of them roughly 2^32 cycles in the future.
++		// Inactive slots (e.g. interrupts that are not pending) go through PastInactive().
++		mutable u32 wrapped = 0;
++
++		void Set(u32 now)
++		{
++			now32 = now;
++			now64 = Epoch + now;
++		}
++
++		// A timestamp taken at or before the reference point (at most 2^32-1 cycles ago).
++		u64 Past(u32 value) const
++		{
++			if (value > now32)
++				wrapped++;
++			return now64 - static_cast<u32>(now32 - value);
++		}
++
++		// Same mapping for a slot whose value is not currently in use; not counted.
++		u64 PastInactive(u32 value) const { return now64 - static_cast<u32>(now32 - value); }
++
++		// A timestamp within +/-2^31 cycles of the reference point (event deadlines etc.).
++		u64 Near(u32 value) const { return now64 + static_cast<s64>(static_cast<s32>(value - now32)); }
++
++		// Same as Near(), against a different (already converted) reference value.
++		static u64 NearTo(u64 ref64, u32 ref32, u32 value)
++		{
++			return ref64 + static_cast<s64>(static_cast<s32>(value - ref32));
++		}
++	};
++
++	struct Context
++	{
++		CycleDomain ee;
++		CycleDomain iop;
++		bool cycles_known = false;
++	};
++
++	struct Entry
++	{
++		std::string name;
++		std::vector<u8> data;
++	};
++
++	// Formats this module can write (forward only): this build's own format (0x9A59) from every
++	// source; 0x9A55 (2.6.x) from 0x9A4F/0x9A50/0x9A54; 0x9A54 (2.4.0) from 0x9A4F/0x9A50;
++	// 0x9A50 (2.2.0) from 0x9A4F.
++	static constexpr u16 TargetFormat9A55 = 0x9A55;
++	static constexpr u16 TargetFormat9A54 = 0x9A54;
++	static constexpr u16 TargetFormat9A50 = 0x9A50;
++
++	struct ConvertedState
++	{
++		// Requested output format; 0 selects this build's own format. Set before ConvertArchive().
++		u16 target_format = 0;
++		u32 source_version = 0;
++		u16 source_format = 0;
++		std::string source_build;
++		Context context;
++		// "PCSX2 Internal Structures.dat" first, followed by the component entries.
++		std::vector<Entry> entries;
++		std::vector<u8> screenshot_png;
++		Report report;
++	};
++
++	bool IsLegacyVersion(u32 savever);
++
++	// Pure in-memory conversions of individual archive entries.
++	// 0x9A54/0x9A55 Internal Structures -> this build's layout.
++	bool ConvertInternalStructures(std::span<const u8> src, std::vector<u8>& dst, Context& ctx, Report& report, Error* error);
++	// 0x9A4F/0x9A50 Internal Structures -> the 0x9A54 layout (TLB rewrite, cached TLB list,
++	// SIO2 busy-frame field, host file handle section).
++	bool UpgradeInternalsTo9A54(std::span<const u8> src, std::vector<u8>& dst, u16 source_format, Report& report, Error* error);
++	bool ConvertSPU2(std::span<const u8> src, std::vector<u8>& dst, const Context& ctx, u16 source_format, Report& report, Error* error);
++
++	// Size of the SPU2 block this module produces (must equal SPU2Savestate::SizeIt()).
++	size_t TargetSPU2Size();
++
++	// Reads and converts a complete legacy archive. Fails without partial output if any
++	// required component cannot be translated and validated.
++	bool ConvertArchive(zip_t* zf, ConvertedState* out, Error* error);
++
++	// Serializes a converted state as a native archive on disk.
++	bool WriteArchive(const ConvertedState& state, const char* filename, Error* error);
++
++	// Builds a native archive in memory (stored, uncompressed) for the standard loader.
++	std::unique_ptr<zip_t, void (*)(zip_t*)> OpenAsNativeArchive(const ConvertedState& state, Error* error);
++} // namespace SaveStateLegacy
+diff --git a/pcsx2/pcsx2.vcxproj b/pcsx2/pcsx2.vcxproj
+index 5dcf68fcc..ce172f966 100644
+--- a/pcsx2/pcsx2.vcxproj
++++ b/pcsx2/pcsx2.vcxproj
+@@ -416,6 +416,7 @@
+     <ClCompile Include="windows\Optimus.cpp" />
+     <ClCompile Include="Pcsx2Config.cpp" />
+     <ClCompile Include="SaveState.cpp" />
++    <ClCompile Include="SaveStateLegacy.cpp" />
+     <ClCompile Include="SourceLog.cpp" />
+     <ClCompile Include="Elfheader.cpp" />
+     <ClCompile Include="CDVD\InputIsoFile.cpp" />
+@@ -877,6 +878,7 @@
+     <ClInclude Include="Common.h" />
+     <ClInclude Include="Config.h" />
+     <ClInclude Include="SaveState.h" />
++    <ClInclude Include="SaveStateLegacy.h" />
+     <ClInclude Include="Counters.h" />
+     <ClInclude Include="Dmac.h" />
+     <ClInclude Include="Hardware.h" />
+diff --git a/pcsx2/pcsx2.vcxproj.filters b/pcsx2/pcsx2.vcxproj.filters
+index b9e3c1a92..dda287560 100644
+--- a/pcsx2/pcsx2.vcxproj.filters
++++ b/pcsx2/pcsx2.vcxproj.filters
+@@ -425,6 +425,9 @@
+     <ClCompile Include="SaveState.cpp">
+       <Filter>System</Filter>
+     </ClCompile>
++    <ClCompile Include="SaveStateLegacy.cpp">
++      <Filter>System</Filter>
++    </ClCompile>
+     <ClCompile Include="SourceLog.cpp">
+       <Filter>System</Filter>
+     </ClCompile>
+@@ -1478,6 +1481,9 @@
+     <ClInclude Include="SaveState.h">
+       <Filter>System\Include</Filter>
+     </ClInclude>
++    <ClInclude Include="SaveStateLegacy.h">
++      <Filter>System\Include</Filter>
++    </ClInclude>
+     <ClInclude Include="Dmac.h">
+       <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
+     </ClInclude>

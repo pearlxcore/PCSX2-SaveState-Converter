@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="SaveStateConverter.Core/SaveStateConverter.Core.csproj" />
+  <Project Path="SaveStateConverter.Gui/SaveStateConverter.Gui.csproj" />
+  <Project Path="SaveStateConverter.Tests/SaveStateConverter.Tests.csproj" />
+  <Project Path="SaveStateConverter.Cli/SaveStateConverter.Cli.csproj" />
+</Solution>

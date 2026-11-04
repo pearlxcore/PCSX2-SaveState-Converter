@@ -1,0 +1,13 @@
+bin/
+obj/
+dist/
+TestResults/
+.vs/
+.idea/
+*.user
+*.suo
+__pycache__/
+# Converter binaries for local builds (see experimental/BUILD.md)
+native/
+# Local work folder (PCSX2 checkout, test files)
+work/

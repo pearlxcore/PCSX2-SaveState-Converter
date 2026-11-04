@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- The file people open: "PCSX2 SaveState Converter.exe". -->
+    <AssemblyName>PCSX2 SaveState Converter</AssemblyName>
+    <RootNamespace>SaveStateConverter.Gui</RootNamespace>
+    <!-- Drawn by tools/make_icon.py; the windows use the same file as their title-bar icon. -->
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- WPF bindings need culture data: InvariantGlobalization must stay off here. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\SaveStateConverter.Core\SaveStateConverter.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Remove="app.ico" />
+    <Resource Include="app.ico" />
+  </ItemGroup>
+  <!-- Single-file release (tools/Package-Release.ps1 passes BundleNativeDir): the converter is
+       published as native\*, bundled into the executable and extracted by the .NET host on start. -->
+  <ItemGroup Condition="'$(BundleNativeDir)' != ''">
+    <None Include="$(BundleNativeDir)\pcsx2-stateconvert.exe;$(BundleNativeDir)\zstd.dll;$(BundleNativeDir)\z.dll"
+          Link="native\%(Filename)%(Extension)" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
