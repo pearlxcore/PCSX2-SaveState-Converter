@@ -49,21 +49,6 @@ A few things to keep in mind:
 - Save states are snapshots, not real saves. Saving to the memory card in game is still the
   safest way to keep your progress.
 
-## Command line
-
-The zip release also comes with a command-line version in `cli\` (needs the .NET 10 Desktop
-Runtime):
-
-```
-saveconvert scan D:\PCSX2\sstates
-saveconvert convert old.p2s --target 2.8.2 --output new.p2s
-saveconvert convert-dir D:\PCSX2\sstates --target 2.8.2 --in-place
-saveconvert backups
-saveconvert restore <backup-set-folder>
-```
-
-Run `saveconvert` on its own to see every option.
-
 ## Building
 
 - App and tests: install the .NET 10 SDK, then run `dotnet build SaveStateConverter.slnx` and
@@ -72,6 +57,12 @@ Run `saveconvert` on its own to see every option.
   `experimental/`, see [experimental/BUILD.md](experimental/BUILD.md). Drop the exe and its two
   DLLs into a `native` folder at the repo root and local builds will pick it up.
 - Release files: `tools/Package-Release.ps1 -NativeDir <folder with pcsx2-stateconvert.exe, zstd.dll and z.dll>`.
+
+## ❤️ Support My Work
+
+[![ko-fi](https://github.com/user-attachments/assets/93da7a03-e740-4f79-9add-8b3741239b2f)](https://ko-fi.com/R6R524N7X)
+
+[![paypal](https://user-images.githubusercontent.com/36906814/102657760-39d1ce00-41b1-11eb-96fe-c10e2d9b3f39.png)](https://www.paypal.com/paypalme/pearlxcoree)
 
 ## License
 
